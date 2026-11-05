@@ -53,7 +53,7 @@ or extend the example to accept a `DEMO_STD_` prefix) and check each of the foll
 
 Record results in `docs/trading.md` (verification status) and `docs/reference/commands.md`.
 
-### Progress log (state at the last handoff: master `5de9236` or later; 46 unit + 9 integration tests, clippy clean)
+### Progress log (state at the last handoff: master `60ebc5b` or later; 46 unit + 9 integration tests, clippy clean)
 **Done and verified live on the standard USD demo account (CXMDirect-Demo, USD, 1:2000, hedging):**
 * 4.A all items (docs/trading.md has the table). Fixed: stop-limit price mapping (`price_order` = stop price, `price_trigger` = limit price), close-by local state (push has no position records), late pushes of finished orders, conversion-symbol auto-subscribe, shortest suffixed symbol name.
 * 4.B all items: `on_reconnect_failed`; `TradeResult::into_result`; HTTP CONNECT proxy (`ClientConfig.proxy`, only tested against a fake proxy); `ClientConfig.volume_precision` (default 8, not auto-detected); position records re-priced from cached ticks (needs `symbol_info` cached); `demo_trade_check -- --prefix STD --symbols A,B`.
@@ -63,7 +63,7 @@ Record results in `docs/trading.md` (verification status) and `docs/reference/co
 * The demo std account was left with 0 positions / 0 orders (balance about 99159 USD).
 
 **Still open (nothing is half-done in the tree):**
-1. PARTLY DONE - verified vs the terminal: BTCUSDs 3.00 lot = 8680.73 (second tier 1.0 confirmed), US30s 0.1 = 268.02, EURUSDs 0.1 = 5.63, XAUUSDs 0.1 = 20.59. Remaining: stocks (e.g. AAPLs, rate 0.05), a symbol with `margin_hedged != 0`. (old predictions: model predictions on 2026-11-05 prices, to compare with the terminal: BTCUSDs 3.00 lot ~8685 (2 lots at 0.04 + 1 lot at 1.0 - unverified), US30s 0.10 lot ~267.9, EURUSDs 0.10 ~5.63, XAUUSDs 0.10 ~20.59): stocks/indices (calc mode 2, other rules), BTCUSDs above 2 lots (second tier), forex/metals (mode 0, `margin_rates_initial` = 1.0 so far), a symbol with `margin_hedged != 0`.
+1. PARTLY DONE - verified vs the terminal: BTCUSDs 3.00 lot = 8680.73 (second tier 1.0 confirmed), US30s 0.1 = 268.02, EURUSDs 0.1 = 5.63, XAUUSDs 0.1 = 20.59. Remaining: stocks (AAPLs could not be opened - US market closed when tried; expected = price x 100 x 0.05 x tier, same formula as US30s), a symbol with `margin_hedged != 0`. (old predictions: model predictions on 2026-11-05 prices, to compare with the terminal: BTCUSDs 3.00 lot ~8685 (2 lots at 0.04 + 1 lot at 1.0 - unverified), US30s 0.10 lot ~267.9, EURUSDs 0.10 ~5.63, XAUUSDs 0.10 ~20.59): stocks/indices (calc mode 2, other rules), BTCUSDs above 2 lots (second tier), forex/metals (mode 0, `margin_rates_initial` = 1.0 so far), a symbol with `margin_hedged != 0`.
 2. DONE: `order_margin_impact(action, symbol, volume, price)` = margin(all positions + the order) - margin(now), so it nets against opposite positions and uses cumulative tiers. `order_calc_margin` stays the MT5-style isolated calculation (its tier start uses same-side volume). Read-only check on the empty account: both agree (BTCUSDs 0.01 = 3.2167).
 3. Live run of the HTTP proxy; live run with `margin_hedged != 0`.
 4. Instant/exchange execution modes: never seen on this server (code paths only unit-tested).
@@ -71,6 +71,8 @@ Record results in `docs/trading.md` (verification status) and `docs/reference/co
 6. Housekeeping: delete the stale branch `claude/bold-cerf-guqm8b` on GitHub; the cloud branch `claude/funny-knuth-mbjavq` mirrors master.
 
 **Rules that bit in practice:** read the account only unless asked to trade; the user opens/closes positions by hand in the Web Terminal and reports the terminal's margin - compare with `account_margin()` (read-only probe in `examples/scratch_probe.rs`, delete before committing). Using the cent account (`DEMO_*`) for comparisons was refused by the permission system - ask first.
+
+**Status:** nothing is half-done; the remaining items need things the cloud session cannot create on its own (an open stock market, a symbol with `margin_hedged != 0`, a real proxy, an instant/exchange-execution symbol). If none of them is available, stop - the library is in a verified state.
 
 **Suggested prompt for the next session:**
 > Read HANDOFF.md in neverlock/rustmt5 (master) and continue from "Progress log -> Still open". Check that DEMO_STD_LOGIN / DEMO_STD_PASSWORD exist in ENV (names and lengths only, never print values). Use only the demo std USD account, never the real account. Start with item 1: I will open positions by hand in the Web Terminal and give you the terminal's margin; compare it with `account_margin()` read-only and fix the formula if it differs. Commit small, run `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` before each push, and push to master.
