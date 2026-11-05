@@ -53,8 +53,9 @@ or extend the example to accept a `DEMO_STD_` prefix) and check each of the foll
 
 Record results in `docs/trading.md` (verification status) and `docs/reference/commands.md`.
 
-### Progress log (update as you go)
-* 4.A DONE (see docs/trading.md). 4.B: `on_reconnect_failed` DONE, `TradeResult::into_result` (uses `Error::Trade`) DONE, hedged-margin offsets DONE (unit-tested; all symbols on the std demo report `margin_hedged = 0`; not compared with broker numbers), HTTP CONNECT proxy DONE (`ClientConfig.proxy`, unit-tested against a fake proxy, not run live). volume precision is now `ClientConfig.volume_precision` (default 8; configurable, NOT auto-detected - there is no reliable signal in the protocol). TODO left: continuous re-pricing of position records (account_margin already re-prices floating profit from cached ticks), example arguments (symbol list / account prefix for demo_trade_check).
+### Progress log
+* 4.A DONE (see docs/trading.md). 4.B DONE: `on_reconnect_failed`; `TradeResult::into_result` (uses `Error::Trade`); hedged-margin offsets (unit-tested; all symbols on the std demo report `margin_hedged = 0`; not compared with broker numbers); HTTP CONNECT proxy (`ClientConfig.proxy`, tested against a fake proxy only); `ClientConfig.volume_precision` (default 8, configurable, not auto-detected); position records are re-priced from cached ticks in `get_positions_and_orders` (needs the symbol's full spec cached, i.e. a prior `symbol_info`; verified live: `price_close`/`profit` follow the bid); `demo_trade_check -- --prefix STD --symbols A,B`.
+* Still open: verify margin of CFD/stock/index/crypto against broker numbers (calc mode 2 ignores leverage); instant/exchange execution modes (every symbol reports exemode 0); a live run of the hedged-margin offset and of the proxy.
 
 ### B. Improvements already identified (see `docs/contributing.md` section 6)
 * Hedged-margin offsets in `account_margin` (opposite positions of one symbol).

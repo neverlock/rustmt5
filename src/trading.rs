@@ -96,7 +96,31 @@ impl Mt5Client {
             st.live_orders = orders.iter().map(|o| (o.get_u64("trade_order"), o.clone())).collect();
             st.trade_state_ready = true;
         }
-        Ok(PositionsAndOrders { positions: st.live_positions.values().cloned().collect(), orders: st.live_orders.values().cloned().collect() })
+        let mut positions: RecordList = st.live_positions.values().cloned().collect();
+        let orders: RecordList = st.live_orders.values().cloned().collect();
+        drop(st);
+        self.reprice_positions(&mut positions);
+        Ok(PositionsAndOrders { positions, orders })
+    }
+
+    /// Refresh `price_close` and `profit` of position records from the cached ticks (buy closes at bid, sell at ask).
+    /// Needs the full symbol spec (contract size etc.) in the cache and `rate_profit` on the record; otherwise the
+    /// push values stay.
+    fn reprice_positions(&self, positions: &mut RecordList) {
+        for p in positions.iter_mut() {
+            let symbol = p.get_str("trade_symbol").to_string();
+            let rate = p.get_f64("rate_profit");
+            let Some(tick) = self.symbol_info_tick(&symbol) else { continue };
+            let Some(info) = self.st().full_symbols.get(&symbol).cloned() else { continue };
+            let is_buy = p.get_i64("trade_action") == POSITION_TYPE_BUY;
+            let now = if is_buy { tick.get_f64("bid") } else { tick.get_f64("ask") };
+            if now <= 0.0 || rate <= 0.0 { continue; }
+            let lots = p.get_f64("trade_volume") / 10f64.powi(self.volume_precision());
+            if let Some(raw) = self.calc_profit_raw(&info, is_buy, lots, p.get_f64("price_open"), now) {
+                p.set("price_close", now);
+                p.set("profit", raw * rate);
+            }
+        }
     }
 
     /// Discard the live state and reload it from the server's cmd 4 answer. Only useful on servers that answer
