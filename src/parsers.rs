@@ -517,14 +517,33 @@ pub fn parse_rate_bars(body: &[u8]) -> RecordList {
     if body.is_empty() { return vec![]; }
     let std_size = get_series_size(RATE_BAR_SCHEMA).unwrap();
     let ext_size = get_series_size(RATE_BAR_SCHEMA_EXT).unwrap();
-    let (schema, names, size) = if body.len().is_multiple_of(ext_size) && ext_size != std_size {
-        (RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, ext_size)
-    } else {
-        (RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, std_size)
+    let parse = |schema, names, size: usize| -> RecordList {
+        (0..body.len() / size).filter_map(|i| SeriesCodec::parse_record(body, schema, names, i * size).ok()).collect()
     };
-    (0..body.len() / size)
-        .filter_map(|i| SeriesCodec::parse_record(body, schema, names, i * size).ok())
-        .collect()
+    // Plausible = every bar time within 2000..2100 and non-decreasing.
+    let plausible = |bars: &RecordList| {
+        let mut prev = 0;
+        bars.iter().all(|b| {
+            let t = b.get_i64("time");
+            let ok = (946_684_800..4_102_444_800).contains(&t) && t >= prev;
+            prev = t;
+            ok
+        })
+    };
+    let ext_fits = body.len().is_multiple_of(ext_size);
+    let std_fits = body.len().is_multiple_of(std_size);
+    if ext_fits && !std_fits {
+        return parse(RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, ext_size);
+    }
+    if ext_fits && std_fits {
+        // Ambiguous (length is a multiple of lcm(48,56)). pymt5 always picked the extended layout here,
+        // which mis-parses standard servers; the standard 48-byte layout is preferred when plausible.
+        let std_bars = parse(RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, std_size);
+        if plausible(&std_bars) { return std_bars; }
+        let ext_bars = parse(RATE_BAR_SCHEMA_EXT, RATE_BAR_FIELD_NAMES_EXT, ext_size);
+        return if plausible(&ext_bars) { ext_bars } else { std_bars };
+    }
+    parse(RATE_BAR_SCHEMA, RATE_BAR_FIELD_NAMES, std_size)
 }
 
 /// Parse `[u32 count][record]*` bodies.
@@ -629,6 +648,27 @@ mod tests {
         assert_eq!(bars[0].get_i64("time"), 1_773_293_460);
         assert_eq!(bars[0].get_i64("tick_volume"), 57);
         assert!(parse_rate_bars(&[]).is_empty());
+    }
+
+    #[test]
+    fn rate_bars_ambiguous_length_prefers_plausible_layout() {
+        let bar = |t: i32, ext: bool| {
+            let mut b = t.to_le_bytes().to_vec();
+            for v in [1.0f64, 2.0, 0.5, 1.5] { b.extend(v.to_le_bytes()); }
+            b.extend(10i64.to_le_bytes());
+            b.extend(0i32.to_le_bytes());
+            if ext { b.extend(99i64.to_le_bytes()); }
+            b
+        };
+        // 7 std bars = 336 bytes = 6 ext bars: ambiguous, must parse as 7 standard bars
+        let std7: Vec<u8> = (0..7).flat_map(|i| bar(1_700_000_000 + i * 3600, false)).collect();
+        assert_eq!(std7.len(), 336);
+        assert_eq!(parse_rate_bars(&std7).len(), 7);
+        // 6 genuine ext bars (336 bytes) fail the std plausibility check and are parsed as ext
+        let ext6: Vec<u8> = (0..6).flat_map(|i| bar(1_700_000_000 + i * 3600, true)).collect();
+        let bars = parse_rate_bars(&ext6);
+        assert_eq!(bars.len(), 6);
+        assert_eq!(bars[5].get_i64("real_volume"), 99);
     }
 
     #[test]
