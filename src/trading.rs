@@ -256,7 +256,10 @@ impl Mt5Client {
         if account_currency.is_empty() { self.fail_last_error(-3, "account currency unavailable"); return Ok(None); }
         let leverage = account.get_i64("leverage");
         let Some(raw) = self.calc_margin_raw(&info, volume, price, leverage) else { return Ok(None) };
-        let raw = raw * margin_rate_factor(&info, &account, volume, is_buy);
+        let prior: f64 = self.get_positions().await?.iter()
+            .filter(|p| p.get_str("trade_symbol") == symbol && (p.get_i64("trade_action") == POSITION_TYPE_BUY) == is_buy)
+            .map(|p| p.get_f64("trade_volume") / 10f64.powi(self.volume_precision())).sum();
+        let raw = raw * margin_rate_factor(&info, &account, prior, volume, is_buy);
         if raw == 0.0 { self.clear_last_error(); return Ok(Some(0.0)); }
         let margin_currency = { let m = info.get_str("currency_margin"); if m.is_empty() { account_currency.clone() } else { m.to_string() } };
         if currencies_equal(&margin_currency, &account_currency) { self.clear_last_error(); return Ok(Some(raw)); }

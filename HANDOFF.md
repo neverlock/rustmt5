@@ -55,8 +55,8 @@ Record results in `docs/trading.md` (verification status) and `docs/reference/co
 
 ### Progress log
 * 4.A DONE (see docs/trading.md). 4.B DONE: `on_reconnect_failed`; `TradeResult::into_result` (uses `Error::Trade`); hedged-margin offsets (unit-tested; all symbols on the std demo report `margin_hedged = 0`; not compared with broker numbers); HTTP CONNECT proxy (`ClientConfig.proxy`, tested against a fake proxy only); `ClientConfig.volume_precision` (default 8, configurable, not auto-detected); position records are re-priced from cached ticks in `get_positions_and_orders` (needs the symbol's full spec cached, i.e. a prior `symbol_info`; verified live: `price_close`/`profit` follow the bid); `demo_trade_check -- --prefix STD --symbols A,B`.
-* Margin for calc mode 2 now follows `margin_rates_initial` x account `leverage_rules` tiers; verified once vs the Web Terminal (0.01 BTCEURs = 40.37). Note: symbol spec fields are in the nested `trade` record (an earlier note saying exemode 0 was wrong; it is 2 = market).
-* Still open: more broker margin comparisons (stocks/indices, volumes above the first tier, several positions of one symbol); instant/exchange execution modes (none seen); a live run of the hedged-margin offset and of the proxy.
+* Margin for calc mode 2 now follows `margin_rates_initial` x account `leverage_rules` tiers; verified vs the Web Terminal (0.01 BTCEURs = 40.37; 0.01 + 2.00 lot = 12175.61, tiers use the symbol's cumulative volume in opening order). Note: symbol spec fields are in the nested `trade` record (an earlier note saying exemode 0 was wrong; it is 2 = market).
+* Still open: more broker margin comparisons (stocks/indices, buy+sell of one symbol (does the tier volume accumulate across sides?)); instant/exchange execution modes (none seen); a live run of the hedged-margin offset and of the proxy.
 
 ### B. Improvements already identified (see `docs/contributing.md` section 6)
 * Hedged-margin offsets in `account_margin` (opposite positions of one symbol).

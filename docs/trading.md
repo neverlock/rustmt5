@@ -2,7 +2,7 @@
 
 > **Verification status.** Verified against real **demo** accounts (CXMDirect-Demo, build 6182): market open/close, partial close, close-by, pending
 > place/modify/cancel (incl. stop-limit and `SPECIFIED` expiration), SL/TP modify, `order_send`/`order_check`, live positions/orders, margin.
-> **Never run against a real-money account.** Not verified: instant/exchange execution modes (every symbol checked on the standard USD account is market execution, mode 2), hedged-margin offsets, multi-tier margin volumes.
+> **Never run against a real-money account.** Not verified: instant/exchange execution modes (every symbol checked on the standard USD account is market execution, mode 2), hedged-margin offsets, tier accumulation across opposite sides.
 
 ### Standard USD demo account (1:2000, hedging) - results
 
