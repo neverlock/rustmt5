@@ -645,3 +645,16 @@ async fn command_filter_blocks_before_anything_is_sent() {
     assert!(b.requests.lock().unwrap().is_empty(), "blocked command must not reach the server");
     c.close().await;
 }
+
+#[tokio::test]
+async fn cached_positions_are_none_before_seeding_and_some_after_login() {
+    let c = Mt5Client::new(cfg(start(Behavior::default()).await));
+    c.connect().await.unwrap();
+    assert!(c.cached_positions_and_orders().is_none());
+    c.login(12345678, "secret").await.unwrap();
+    let cached = c.cached_positions_and_orders().expect("seeded by login");
+    let fetched = c.get_positions_and_orders().await.unwrap();
+    assert_eq!(cached.positions.len(), fetched.positions.len());
+    assert_eq!(cached.orders.len(), fetched.orders.len());
+    c.close().await;
+}

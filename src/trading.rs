@@ -104,6 +104,18 @@ impl Mt5Client {
         Ok(PositionsAndOrders { positions, orders })
     }
 
+    /// Current positions/orders from the push-maintained state without asking the server, or `None` until
+    /// the first [`get_positions_and_orders`](Self::get_positions_and_orders) call (done by `login_with`) has seeded it.
+    pub fn cached_positions_and_orders(&self) -> Option<PositionsAndOrders> {
+        let st = self.st();
+        if !st.trade_state_ready { return None; }
+        let mut positions: RecordList = st.live_positions.values().cloned().collect();
+        let orders: RecordList = st.live_orders.values().cloned().collect();
+        drop(st);
+        self.reprice_positions(&mut positions);
+        Some(PositionsAndOrders { positions, orders })
+    }
+
     /// Refresh `price_close` and `profit` of position records from the cached ticks (buy closes at bid, sell at ask).
     /// Needs the full symbol spec (contract size etc.) in the cache and `rate_profit` on the record; otherwise the
     /// push values stay.
