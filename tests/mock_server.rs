@@ -658,3 +658,11 @@ async fn cached_positions_are_none_before_seeding_and_some_after_login() {
     assert_eq!(cached.orders.len(), fetched.orders.len());
     c.close().await;
 }
+
+#[tokio::test]
+async fn reprice_can_be_switched_off() {
+    let uri = start(Behavior::default()).await;
+    let off = Mt5Client::new(ClientConfig { reprice_positions: false, ..cfg(uri.clone()) });
+    assert!(!off.config().reprice_positions);
+    assert!(Mt5Client::new(cfg(uri)).config().reprice_positions);
+}

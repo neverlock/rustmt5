@@ -54,6 +54,9 @@ pub struct ClientConfig {
     /// HTTP `CONNECT` proxy for the WebSocket, `http://[user:pass@]host:port`. `None` = direct TCP (the default).
     pub proxy: Option<String>,
     /// Supply the WebSocket yourself (e.g. a browser-impersonating TLS stack) instead of the built-in rustls one.
+    /// Recompute `profit`/`price_close` of position records from cached ticks (default `true`). Turn off when the
+    /// caller computes floating profit itself; the records then keep the server's values from the last snapshot/push.
+    pub reprice_positions: bool,
     pub link_connector: Option<Arc<dyn crate::transport::LinkConnector>>,
     /// Policy hook run before every command; `false` refuses it (see [`crate::transport::CommandFilter`]).
     pub command_filter: Option<crate::transport::CommandFilter>,
@@ -83,6 +86,7 @@ impl Default for ClientConfig {
             symbol_cache_ttl: 0.0,
             ca_bundle: None,
             proxy: None,
+            reprice_positions: true,
             link_connector: None,
             command_filter: None,
             volume_precision: crate::constants::VOLUME_PRECISION,

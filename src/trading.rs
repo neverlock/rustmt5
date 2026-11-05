@@ -120,6 +120,7 @@ impl Mt5Client {
     /// Needs the full symbol spec (contract size etc.) in the cache and `rate_profit` on the record; otherwise the
     /// push values stay.
     fn reprice_positions(&self, positions: &mut RecordList) {
+        if !self.inner.config.reprice_positions { return; }
         for p in positions.iter_mut() {
             let symbol = p.get_str("trade_symbol").to_string();
             let rate = p.get_f64("rate_profit");
