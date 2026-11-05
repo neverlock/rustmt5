@@ -36,4 +36,70 @@ for n in consts:
     out.append(f"\n## `{n}`  ({len(sch)} fields, {off} bytes)\n")
     out.append("| # | field | type | size | offset |\n|---|---|---|---|---|")
     out += rows
+out.append("""
+---
+
+## Corrections: layouts that differ from the pymt5 schemas above
+
+These were verified against Web Terminal build 6182 (and, for the request, against the Web Terminal JS
+`getTradeRequest`). The Rust code uses these, not the generated constants, for the items below.
+
+### Trade request, cmd 12 payload (248 bytes) - `TRADE_REQUEST_SCHEMA` above (236 bytes) is wrong
+
+| # | field | type | size | offset |
+|---|---|---|---|---|
+| 0 | action_id | u32 | 4 | 0 |
+| 1 | trade_action | u32 | 4 | 4 |
+| 2 | trade_symbol | utf16le str | 64 | 8 |
+| 3 | trade_volume | u64 | 8 | 72 |
+| 4 | digits | u32 | 4 | 80 |
+| 5 | trade_order | u64 | 8 | 84 |
+| 6 | trade_type | u32 | 4 | 92 |
+| 7 | type_filling | u32 | 4 | 96 |
+| 8 | type_time | u32 | 4 | 100 |
+| 9 | type_flags | u32 | 4 | 104 |
+| 10 | type_reason | u32 | 4 | 108 |
+| 11 | price_order | f64 | 8 | 112 |
+| 12 | price_trigger | f64 | 8 | 120 |
+| 13 | price_sl | f64 | 8 | 128 |
+| 14 | price_tp | f64 | 8 | 136 |
+| 15 | price_deviation | **u32** | 4 | 144 |
+| 16 | price_top | f64 | 8 | 148 |
+| 17 | price_bottom | f64 | 8 | 156 |
+| 18 | comment | utf16le str | 64 | 164 |
+| 19 | trade_position | u64 | 8 | 228 |
+| 20 | position_by | u64 | 8 | 236 |
+| 21 | time_expiration | u32 | 4 | 244 |
+
+### Trade result push, cmd 19 (380 bytes) - replaces `TRADE_RESULT_PUSH` + `TRADE_RESULT_RESPONSE`
+
+`u32 token` (offset 0) + the 248-byte request above echoed back (offset 4) + result (offset 252, 128 bytes):
+
+| # | field | type | size | offset (in result) |
+|---|---|---|---|---|
+| 0 | retcode | u32 | 4 | 0 |
+| 1 | deal | i64 | 8 | 4 |
+| 2 | order | i64 | 8 | 12 |
+| 3 | volume | i64 | 8 | 20 |
+| 4 | price | f64 | 8 | 28 |
+| 5 | res_time | u32 | 4 | 36 |
+| 6 | bid | f64 | 8 | 40 |
+| 7 | ask | f64 | 8 | 48 |
+| 8 | last | f64 | 8 | 56 |
+| 9 | comment | utf16le str | 64 | 64 |
+
+### Trade update push, cmd 10
+
+| `update_type` | length | layout |
+|---|---|---|
+| 2 (deal/position/balance) | 760 | `u32 type, u32 transaction_id, u32 reserved` + DEAL (356) + POSITION (344) + 6 x f64 balance block |
+| 0 (open orders), 1 (history orders) | 368 (736 for some deletes) | `u32 type, u32 transaction_id, u32 transaction_type (0 add, 1 update, 2 delete)` + ORDER (356) |
+
+A closed position is reported with `trade_volume == 0`. pymt5 assumes counted lists and a 12-byte
+`TRADE_TRANSACTION`; both are wrong for this build (kept as a fallback for older servers).
+
+### Positions / orders, cmd 4
+
+`[u32 n_pos][POSITION x n][u32 n_ord][ORDER x n]` followed by a **12-byte trailer** on build 6182.
+""")
 open(sys.argv[2], "w").write("\n".join(out) + "\n")

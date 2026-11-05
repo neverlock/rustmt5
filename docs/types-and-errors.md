@@ -1,80 +1,77 @@
-# Types, Records, and Errors
+# Types, Records and Errors
 
-## 1. `Value` และ `Record` (`protocol.rs`)
+## 1. `Value` and `Record` (`protocol.rs`)
 
 ```rust
 enum Value { Null, Bool(bool), Int(i64), UInt(u64), Float(f64), Str(String), Bytes(Vec<u8>), List(Vec<Value>), Record(Record) }
-struct Record(IndexMap<String, Value>);   // Deref → IndexMap, เรียงตามลำดับ field
+struct Record(IndexMap<String, Value>);   // derefs to IndexMap, keeps field order
 ```
 
-ชนิดที่ parse ออกมา: signed → `Int`, unsigned → `UInt`, float → `Float`, time → `Int`(unix ms), string → `Str`, bytes → `Bytes`,
-บล็อกซ้อน (`tiers`, `trade`, `bids`, …) → `List`/`Record`
+Parsed types: signed -> `Int`, unsigned -> `UInt`, floats -> `Float`, time -> `Int` (unix ms), strings -> `Str`, bytes -> `Bytes`; nested blocks (`tiers`, `trade`, `bids`, ...) -> `List`/`Record`.
 
-### Getter แบบให้อภัย (เลียนแบบ `d.get(k) or 0` ของ Python)
+### Forgiving getters (the `d.get(k) or 0` idiom of pymt5)
 
-| เมธอด | ถ้า key ไม่มี / ชนิดไม่ตรง |
+| method | missing key / wrong type |
 |---|---|
-| `get_i64`, `get_u64` | `0` (u64: ค่าติดลบ → 0) |
-| `get_f64` | `0.0` (รับ Int/UInt แปลงให้) |
-| `get_bool` | `false` (ตัวเลข ≠ 0 = true) |
+| `get_i64`, `get_u64` | `0` (negative -> 0 for `u64`) |
+| `get_f64` | `0.0` (ints are converted) |
+| `get_bool` | `false` (non-zero numbers are `true`) |
 | `get_str` | `""` |
-| `get_record`, `get_list`, `get_records` | `None` / `&[]` / ว่าง |
+| `get_record`, `get_list`, `get_records` | `None` / `&[]` / empty |
 
-ข้อควรระวัง: **ไม่มี error เมื่อพิมพ์ชื่อ key ผิด** (ได้ 0 เงียบ ๆ). ใช้ `contains_key` / `rec.get("k")` เมื่อต้องแยก "ไม่มี" ออกจาก "ศูนย์"
-และอ้างอิงชื่อ key จาก [reference/schemas.md](reference/schemas.md) (หรือ `*_FIELD_NAMES`)
+**A misspelt key silently yields 0.** Use `contains_key` or `rec.get("k")` when "absent" must be distinguished from "zero", and take names from
+[reference/schemas.md](reference/schemas.md) or the `*_FIELD_NAMES` constants.
 
-สร้าง Record: `Record::new().with("symbol", "EURUSD").with("volume", 0.01)`; `Value: From<i*, u*, f*, bool, &str, String, Vec<u8>, Record, Vec<Record>, Vec<f64>>`
+Build records with `Record::new().with("symbol", "EURUSD").with("volume", 0.01)`. `Value: From<i*, u*, f*, bool, &str, String, Vec<u8>, Record, Vec<Record>, Vec<f64>>`.
 
-## 2. Struct ผลลัพธ์ (`types.rs`)
+## 2. Result structs (`types.rs`)
 
-| ชนิด | ใช้กับ |
+| type | used for |
 |---|---|
-| `TradeResult` | ผล `trade_request` / helper ส่งออเดอร์; `Display` = `TradeResult(retcode=…, success=…, …)` |
+| `TradeResult` | outcome of `trade_request` and the order helpers; `Display` = `TradeResult(retcode=..., success=..., ...)` |
 | `AccountInfo` | `get_account_summary` |
-| `SymbolInfo` | cache พื้นฐานของ symbol |
-| `VerificationStatus`, `OpenAccountResult` | เปิดบัญชี (`OpenAccountResult::success()` = `code == 0`) |
-| `AccountOpeningRequest` (`DemoAccountRequest` = alias), `RealAccountRequest{ base, … }`, `AccountDocument` | payload เปิดบัญชี; `Default` ตั้ง deposit 100000, leverage 100 |
-| `TickEvent`, `BookEvent`, `TradeResultEvent`, `AccountEvent` | push แบบ typed (มี `raw: Record`) |
+| `SymbolInfo` | cached basic symbol data |
+| `VerificationStatus`, `OpenAccountResult` | account opening (`OpenAccountResult::success()` is `code == 0`) |
+| `AccountOpeningRequest` (`DemoAccountRequest` alias), `RealAccountRequest { base, ... }`, `AccountDocument` | opening payloads; `Default` = deposit 100000, leverage 100 |
+| `TickEvent`, `BookEvent`, `TradeResultEvent`, `AccountEvent` | typed pushes (each has `raw: Record`) |
 | `HealthStatus` | `health_check` |
+| `PositionsAndOrders`, `TradeHistory`, `TradeUpdate` | grouped records |
+| `MarketOrderOptions`, `PendingOrderOptions`, `CloseOptions`, `ModifyOrderOptions`, `HistoryFilter`, `TradeRequest` | inputs |
 
 ## 3. `TimeArg`
 
-อาร์กิวเมนต์เวลาที่รับ `i64/i32/u32/u64` (วินาที), `f64` (วินาทีทศนิยม), `SystemTime` ผ่าน `impl Into<TimeArg>`:
+Time arguments accept `i64/i32/u32/u64` (seconds), `f64` (fractional seconds) or `SystemTime` through `impl Into<TimeArg>`:
 
-| ฟังก์ชัน | int วินาที | float | SystemTime |
+| function | integer seconds | float | SystemTime |
 |---|---|---|---|
-| `coerce_timestamp` | ตามเดิม | ตัดทศนิยม | วินาทีตัดทศนิยม |
-| `coerce_timestamp_ms` | `×1000` | `×1000` | `secs_f64×1000` |
-| `coerce_timestamp_ms_end` | `×1000+999` | จำนวนเต็ม → `+999`; ไม่ใช่ → ms ปกติ | ms ปกติ |
+| `coerce_timestamp` | as is | truncated | whole seconds |
+| `coerce_timestamp_ms` | `* 1000` | `* 1000` | `secs_f64 * 1000` |
+| `coerce_timestamp_ms_end` | `* 1000 + 999` | whole number -> `+ 999`, else plain ms | plain ms |
 
-`*_end` ใช้เป็นขอบบนแบบรวมของ `copy_ticks_range` (ครอบคลุมทั้งวินาที)
+`*_end` is the inclusive upper bound used by `copy_ticks_range`.
 
 ## 4. `Error` (`error.rs`)
 
-| variant | เกิดเมื่อ | ตัวอย่าง |
+| variant | raised when | example |
 |---|---|---|
-| `Connection { message, server_uri }` | เปิด socket/bootstrap ไม่ได้, socket หลุดระหว่างรอคำตอบ | TLS ผิด, bootstrap code ≠ 0 |
-| `Authentication(String)` | login `code ≠ 0` | `code=3` |
-| `Trade { message, retcode, symbol, action }` | สงวนไว้สำหรับความผิดพลาดการเทรด (ปัจจุบัน `trade_request` คืน `TradeResult` แทน) | |
-| `Protocol(String)` | frame/parse ผิด, ค่าเกินช่วง serialize | `frame length mismatch`, `buffer too short` |
-| `SymbolNotFound(String)` | `subscribe_symbols` ชื่อไม่อยู่ใน cache | |
-| `Validation(String)` | อินพุตไม่ผ่านการตรวจ | `volume must be > 0` |
-| `Session(String)` | สถานะไม่ถูกต้อง | `transport not ready`, `transport closed` |
-| `Timeout(String)` | command เกินเวลา | |
-| `WebSocket(Box<tungstenite::Error>)`, `Io` | ชั้นล่าง | |
+| `Connection { message, server_uri }` | cannot open the socket / bootstrap, or the socket drops while waiting | TLS failure, bootstrap `code != 0` |
+| `Authentication(String)` | login `code != 0` | `code=3` |
+| `Trade { .. }` | reserved (trade failures are reported as `TradeResult`, as in pymt5) | |
+| `Protocol(String)` | malformed frame/body, value out of range | `frame length mismatch`, `buffer too short` |
+| `SymbolNotFound(String)` | name not in the cache | `subscribe_symbols` |
+| `Validation(String)` | input rejected locally (also: position/order not found for a helper) | `volume must be > 0` |
+| `Session(String)` | wrong state | `transport not ready`, `transport closed` |
+| `Timeout(String)` | command or trade-result wait timed out | |
+| `WebSocket(Box<..>)`, `Io` | lower layers | |
 
-(`WebSocket` ถูก box เพื่อให้ `Error` เล็ก — clippy `result_large_err`)
+### Soft errors (`client::is_soft_error`)
 
-### "Soft error" (`client::is_soft_error`)
-
-Python จับ `KeyError/ValueError/RuntimeError/TypeError` ในหลาย helper แบบ best-effort. Rust แมปเป็น:
-`Protocol | Validation | Session | Trade | SymbolNotFound` = soft → helper แปลงเป็น `None`/ค่า fallback + `last_error`;
-`Timeout | Connection | WebSocket | Io | Authentication` = **propagate** (เหมือน Python ที่ไม่จับ `TimeoutError`/`ConnectionError`)
-
-ใช้ใน: `find_conversion_symbol_name`, `detect_close_direction`, และ `order_calc_*`/`order_check`/`version` (เฉพาะ Protocol/Validation ตามต้นฉบับ)
+pymt5 catches `KeyError/ValueError/RuntimeError/TypeError` in several best-effort helpers. Mapping: `Protocol | Validation | Session | Trade | SymbolNotFound` are *soft*
+(helper returns `None`/fallback and sets `last_error`); `Timeout | Connection | WebSocket | Io | Authentication` always propagate (like pymt5 not catching `TimeoutError`/`ConnectionError`).
+Used by `find_conversion_symbol_name` and the `order_calc_*` family.
 
 ## 5. Constants
 
-`constants::*` — id ของ command (`u16`), `TRADE_ACTION_*`, `ORDER_TYPE_*`, `ORDER_FILLING_*`, `ORDER_TIME_*`, `POSITION_TYPE_*`, `DEAL_*`, `ORDER_STATE_*`
-(เป็น `i64` เพื่อเทียบกับค่าใน `Record` ได้ตรง ๆ), `TRADE_RETCODE_*` (`u32`), `PERIOD_*` (`u16`), `*_CALC_MODES`, `VOLUME_PRECISION`
-ส่วนที่เป็นเลขล้วนอยู่ใน `constants_gen.rs` (generate จาก Python ด้วย `tools/gen_constants.py`)
+`constants::*`: command ids (`u16`), `TRADE_ACTION_*` (incl. the execution-mode actions `INSTANT/MARKET/EXCHANGE` = 2/3/4), `ORDER_TYPE_*`, `ORDER_FILLING_*`, `ORDER_TIME_*`, `POSITION_TYPE_*`,
+`DEAL_*`, `ORDER_STATE_*` (these are `i64` so they compare directly with `Record` values), `TRADE_RETCODE_*` (`u32`), `PERIOD_*` (`u16`), `*_CALC_MODES`, `VOLUME_PRECISION`.
+Numeric constants live in `constants_gen.rs` (generated by `tools/gen_constants.py`).

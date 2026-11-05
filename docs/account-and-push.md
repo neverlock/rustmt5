@@ -1,110 +1,103 @@
-# Account & Push notifications
+# Account and push notifications
 
-## 1. Account response (cmd 3 / push cmd 14) — `parsers::parse_account_response`
+## 1. Account response (cmd 3, also push cmd 14) - `parsers::parse_account_response`
 
-Body = ต่อเนื่องกันดังนี้ (offset ไล่ไปเรื่อย ๆ):
+The body is a sequence of sections:
 
-| ส่วน | ขนาด | หมายเหตุ |
+| Section | Size | Notes |
 |---|---|---|
-| `ACCOUNT_WEB_MAIN` | 816 B | ฟิลด์หลัก (ดู [schemas](reference/schemas.md)) — ต้องมีอย่างน้อยเท่านี้ ไม่งั้นคืน `Record` ว่าง |
-| `u32 n` + `ACCOUNT_WEB_TRADE_SETTINGS`×n (628 B) | 4 + 628n | กฎราคา/volume/swap ต่อ path ของ symbol |
+| `ACCOUNT_WEB_MAIN` | 816 B | main fields ([schemas](reference/schemas.md)); shorter bodies return an **empty** `Record` |
+| `u32 n` + `ACCOUNT_WEB_TRADE_SETTINGS` x n (628 B) | 4 + 628n | per-path price/volume/swap rules |
 | `i32 trade_flags` | 4 | |
 | `i32 symbols_count` | 4 | |
 | `u64 leverage_flags` | 8 | |
-| `i32 m` + (`LEVERAGE_RULE` 300 B + `tier_count`×`LEVERAGE_TIER` 32 B)×m | | `leverage_rules` (และ alias `rules`) |
-| `u32 k` + (`COMMISSION` 304 B + `u32 t` + t×`COMMISSION_TIER` 80 B)×k | | `commissions` |
+| `i32 m` + (`LEVERAGE_RULE` 300 B + `tier_count` x `LEVERAGE_TIER` 32 B) x m | | `leverage_rules` (alias `rules`) |
+| `u32 k` + (`COMMISSION` 304 B + `u32 t` + t x `COMMISSION_TIER` 80 B) x k | | `commissions` |
 
-> ⚠ **Quirk ที่คงจาก pymt5:** ถ้า `n == 0` ตัวนับ 4 ไบต์ **ไม่ถูกข้าม** (offset ไม่ขยับ) ทำให้ `trade_flags`/`symbols_count` ที่ตามมาเพี้ยน
-> เซิร์ฟเวอร์จริงส่ง `n ≥ 1` เสมอจึงไม่เจอ แต่ถ้าเขียน mock ให้ใส่ trade settings อย่างน้อย 1 รายการ
+> **Quirk kept from pymt5:** when `n == 0` the 4-byte counter is *not* skipped, so `trade_flags`/`symbols_count` that follow are misread. Real servers send `n >= 1`;
+> when writing a mock include at least one trade-settings record.
 
-parser ทุกชั้นหยุดเมื่อ body หมด (ไม่ error) ถ้าพังกลางทางทั้งก้อน → `Record` ว่าง (ผู้เรียกควรเช็ก `is_empty()`)
+If parsing fails mid-way the whole result is an empty `Record` - callers should check `is_empty()`.
 
-### Field ที่คำนวณเพิ่ม
+### Derived fields
 
-| คีย์ | ที่มา |
+| key | source |
 |---|---|
-| `currency` | `account_currency` |
-| `leverage` | `margin_leverage` |
-| `name`, `server` | `account_name`, `server_name` |
-| `daylight_mode`, `server_offset_time` | `daylightmode`; `timezone_shift + daylight_mode·3600` |
-| `is_real/is_demo/is_contest/is_preliminary` | `account_type` = 0 / 1 / 2 / 3 |
-| `trade_allowed` | `!(rights & 4)`; `is_trade_disabled` = ตรงข้าม |
-| `is_investor` | `rights & 8` · `is_read_only` `rights & 512` · `is_reset_pass` `rights & 1024` |
+| `currency`, `leverage`, `name`, `server` | `account_currency`, `margin_leverage`, `account_name`, `server_name` |
+| `daylight_mode`, `server_offset_time` | `daylightmode`; `timezone_shift + daylight_mode*3600` |
+| `is_real` / `is_demo` / `is_contest` / `is_preliminary` | `account_type` = 0 / 1 / 2 / 3 |
+| `trade_allowed` (and `is_trade_disabled`) | `!(rights & 4)` |
+| `is_investor`, `is_read_only`, `is_reset_pass` | `rights & 8`, `& 512`, `& 1024` |
 | `is_hedged_margin` | `margin_mode == 2` |
 | `risk_warning` | `permissions_flags & 16` |
 | `profit` | `acc_profit` |
-| `equity` | `balance + credit + profit` |
-| `auth_password_min` | ค่าที่ได้ ถ้า 0 → 8 |
+| `equity` | `balance + credit + profit` (**does not include floating profit if `acc_profit` is not pushed**; see `account_margin`) |
+| `auth_password_min` | the value, or 8 when 0 |
 
-**ไม่มีใน response:** `margin`, `margin_free`, `margin_level` (จะอ่านได้ 0 จาก `get`) — ดู [trading.md](trading.md)
-ค่าเหล่านี้มากับ push cmd 10 (balance update)
+**Not in the record:** `margin`, `margin_free`, `margin_level` (reading them gives 0). Use `account_margin()` ([trading.md](trading.md#5-margin-equity-and-profit-local)).
 
-ตัวอย่างจริง (build 6182): `server="CXMDirect-Live" currency=USD leverage=1:1000 real=true trade_allowed=true`
+Verified live: live account `CXMDirect-Live`, USD, 1:1000, real; demo account `CXMDirect-Demo`, **USC (cent)**, 1:2000, `is_demo = true`.
 
-### API ที่ห่อ cmd 3
+### Methods built on cmd 3
 
-| เมธอด | ผล |
+| method | result |
 |---|---|
-| `get_account` / `account_info` | `Record` ข้างบน |
-| `terminal_info` | `Record` สไตล์ MetaTrader5 (`build, company, name, server, connected, trade_allowed, tradeapi_disabled, timezone_shift, server_offset_time` …; path ต่าง ๆ ว่าง) |
-| `version` | `Some((500, build, release_date))`; `release_date` จากตารางที่สังเกต (5687 → "15 Mar 2026"), build ที่ไม่รู้ = `""` |
-| `get_account_summary` | `AccountInfo` + จำนวน positions/orders; ถ้า cmd 3 พังจะคำนวณ profit จาก positions |
+| `get_account` / `account_info` | the `Record` above |
+| `terminal_info` | MetaTrader5-style record (`build, company, name, server, connected, trade_allowed, tradeapi_disabled, timezone_shift, server_offset_time`; paths empty) |
+| `version` | `Some((500, build, release_date))`; the date comes from a small table of observed builds (5687 -> "15 Mar 2026"), else `""` |
+| `get_account_summary` | `AccountInfo` with locally computed margin figures and position/order counts |
 
-## 2. คำสั่งบัญชีอื่น ๆ (ยังไม่เคยทดสอบกับเซิร์ฟเวอร์จริง)
+## 2. Other account commands (not exercised against a real server)
 
-| เมธอด | cmd | หมายเหตุ |
+| method | cmd | notes |
 |---|---|---|
-| `change_password(new, old, is_investor)` | 24 | คืน `i32` status (0 = สำเร็จ ตามที่เข้าใจ) — **เปลี่ยนรหัสจริง** |
+| `change_password(new, old, is_investor)` | 24 | returns an `i32` status - **changes the real password** |
 | `trader_params` | 41 | `(String, String)` |
-| `send_notification(msg)` | 42 | ตัดที่ 128 ตัวอักษร |
+| `send_notification(msg)` | 42 | truncated to 128 characters |
 | `get_corporate_links` | 44 | `link_type, url, label, flags, icon_data` |
 | `verify_code(code)` | 27 | |
-| `open_demo_account(&DemoAccountRequest, cid, initialize)` | 30 | payload = `build_opening_base_payload` |
-| `open_real_account(&RealAccountRequest, …)` | 39 | base + ฟิลด์เพิ่ม + 512 B reserved + เอกสาร (`AccountDocument`) |
-| `request_opening_verification` / `submit_opening_verification` | 27 / 40 | คืน `VerificationStatus{email, phone}` |
+| `open_demo_account(&DemoAccountRequest, cid, initialize)` | 30 | `build_opening_base_payload` |
+| `open_real_account(&RealAccountRequest, ...)` | 39 | base + extra fields + 512 B reserved + documents |
+| `request_opening_verification` / `submit_opening_verification` | 27 / 40 | `VerificationStatus { email, phone }` |
 | `enable_otp` / `disable_otp` | 43 | |
 
-`build_opening_base_payload` เรียง 22 field (ชื่อเต็ม = `first second` ตัด 128, group, phone_password, country, city, state, zipcode,
-address, phone, email, deposit f64, leverage u32, 0, 1, domain, utm_*, confirm codes, first/second name, agreements) — รวม 1 664 B
-(มี unit test ตรวจขนาด). `birth_date_ms` ใช้ `PropType::Time` (FILETIME)
-
-`initialize = true` จะส่ง `init_session` (cmd 29) ก่อน โดยใช้ `cid` เดียวกัน
+`build_opening_base_payload` writes 22 fields (full name `first second` truncated to 128, group, phone_password, country, city, state, zipcode, address, phone,
+email, deposit f64, leverage u32, 0, 1, domain, utm_*, confirm codes, first/second name, agreements) = 1 664 B (unit-tested). `birth_date_ms` is a `Time` field.
+`initialize = true` sends `init_session` (cmd 29) first with the same `cid`.
 
 ## 3. Push handlers
 
-ทุก `on_*` คืน `ListenerId` (ลบด้วย `client.transport().off(cmd, Some(id))`) และ callback เป็น closure `Fn(..) + Send + Sync + 'static` ที่รันบน recv task
+Every `on_*` returns a `ListenerId` (remove with `client.transport().off(cmd, Some(id))`). Callbacks are `Fn(..) + Send + Sync + 'static` closures running on the recv task.
 
-| เมธอด | cmd | callback รับ | parse |
+| method | cmd | callback gets | parsing |
 |---|---|---|---|
-| `on_tick` | 8 | `&[Record]` (ทั้ง batch) | `parse_tick_batch` (+ merge cache + normalise) |
-| `on_tick_event` | 8 | `&TickEvent` (ทีละ tick) | `timestamp` = `tick_time_ms` (ถ้า 0 ใช้ `tick_time`) |
-| `on_position_update` / `on_order_update` | 4 | `&[Record]` | ส่วนที่เกี่ยวข้องของ cmd 4 |
-| `on_trade_update` | 4 | `&TradeUpdate{positions, orders}` | cmd 4 ทั้งก้อน |
-| `on_account_update` | 14 | `&Record` | `parse_account_response` (ว่างได้) |
-| `on_account_event` | 14 | `&AccountEvent` | ข้ามถ้า parse ได้ว่าง; `margin/margin_free` มักเป็น 0 |
-| `on_trade_result` | 19 | `&Record` | `TRADE_RESULT_PUSH` + `result: TRADE_RESULT_RESPONSE` |
-| `on_trade_result_event` | 19 | `&TradeResultEvent` | `retcode/order/deal/volume/price/comment` จาก `result` |
-| `on_trade_transaction` | 10 | `&Record` | ดูข้างล่าง |
+| `on_tick` | 8 | `&[Record]` (whole batch) | `parse_tick_batch` (+cache merge, +normalisation if enabled) |
+| `on_tick_event` | 8 | `&TickEvent` (one tick) | `timestamp = tick_time_ms` (or `tick_time` when 0) |
+| `on_position_update`, `on_order_update` | 4 | `&[Record]` | the matching part of cmd 4 (fires for **responses** too) |
+| `on_trade_update` | 4 | `&TradeUpdate { positions, orders }` | whole cmd 4 body |
+| `on_account_update` / `on_account_event` | 14 | `&Record` / `&AccountEvent` | `parse_account_response` (`margin*` are 0) |
+| `on_trade_result` | 19 | `&Record` | `parse_trade_result_push`: request fields + `result: { retcode, deal, order, trade_order, volume, price, bid, ask, comment }` |
+| `on_trade_result_event` | 19 | `&TradeResultEvent` | `retcode/order/deal/volume/price/comment` from `result` (one event **per push**, including intermediate `10002`) |
+| `on_trade_transaction` | 10 | `&Record` | `parse_trade_transaction` (below) |
 | `on_book_update` / `on_book_event` | 23 | `&[Record]` / `&BookEvent` | `parse_book_entries` |
-| `on_symbol_details` | 17 | `&[Record]` | `SYMBOL_DETAILS` ต่อกัน + `symbol` |
-| `on_symbol_update` | 13 | `&CommandResult` | raw (schema ไม่แน่นอน) |
-| `on_login_status` | 15 | `&CommandResult` | raw |
-| `on_callback_error` | – | `&CallbackError{command, message}` | เรียกเมื่อ callback ใด panic |
+| `on_symbol_details` | 17 | `&[Record]` | `SYMBOL_DETAILS` records + `symbol` |
+| `on_symbol_update`, `on_login_status` | 13, 15 | `&CommandResult` | raw |
+| `on_callback_error` | - | `&CallbackError { command, message }` | called when any callback panics |
 
-### Trade transaction (cmd 10)
+### cmd 10: `parse_trade_transaction`
 
-`update_type = u32(body[0..4])`
+`update_type` is the first u32 (also exposed as `flag_mask`). Layouts are in [protocol.md](protocol.md#11-trade-update-push-cmd-10):
 
-* `== 2` (balance update): `balance_info` (`TRADE_UPDATE_BALANCE`: balance, credit, acc_profit, equity, **margin, margin_free**) →
-  `deals` (counted `DEAL`) → `positions` (counted `POSITION`; offset ข้าม deals ด้วย `4 + n·356`)
-* อื่น ๆ: `TRADE_TRANSACTION` (`flag_mask`, `transaction_id`, `transaction_type` 0=add 1=update 2=delete) แล้วตามด้วย `order` (`ORDER`)
+* build 6182, type 2: `transaction_id`, `deals` (one deal), `positions` (one position; `trade_volume == 0` = closed), `balance_info`.
+* build 6182, type 0: `transaction_id`, `transaction_type` (0 add / 1 update / 2 delete), `order`; type 1: the same for a history order.
+* older pymt5 layouts are still parsed when the length matches them (type 2 with counted lists; 372-byte order pushes).
 
-> ข้อสังเกต: listener ของ cmd 4 / 14 ถูกเรียกทั้งตอนมี **response** ของ `get_positions_and_orders()`/`get_account()` และตอนมี push จริง
+The client also consumes these pushes itself to maintain the live positions/orders ([client.md](client.md#live-trading-state)); a user handler is optional.
 
-### การเขียน handler ที่ปลอดภัย
+### Writing a safe handler
 
 ```rust
 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-client.on_tick_event(move |t| { let _ = tx.send(t.clone()); });   // ส่งออกทันที ไม่ทำงานหนักใน callback
-tokio::spawn(async move { while let Some(t) = rx.recv().await { /* งานหนัก / async */ } });
+client.on_tick_event(move |t| { let _ = tx.send(t.clone()); });      // return immediately
+tokio::spawn(async move { while let Some(t) = rx.recv().await { /* heavy or async work */ } });
 ```

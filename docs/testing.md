@@ -1,83 +1,94 @@
 # Testing
 
-## 1. รันเทสต์
+## 1. Running
 
 ```bash
-cargo test --all-targets          # unit (33) + integration กับ mock server (7)
+cargo test --all-targets          # 40 unit tests + 9 integration tests against the mock server
 cargo test --doc                  # doctest
 cargo clippy --all-targets -- -D warnings
-cargo doc --no-deps               # rustdoc
+cargo doc --no-deps
 ```
 
-CI (`.github/workflows/ci.yml`) รัน clippy (deny warnings) + test + doctest
+CI (`.github/workflows/ci.yml`) runs clippy (warnings denied), the tests and the doctest.
 
-## 2. Unit tests (ในแต่ละไฟล์ `#[cfg(test)]`)
+## 2. Unit tests (`#[cfg(test)]` modules)
 
-| ไฟล์ | ครอบคลุม |
+| file | covers |
 |---|---|
-| `helpers.rs` | hex, UTF-16LE round-trip (รวมภาษาไทย), ASCII pad, client id |
-| `crypto.rs` | ความยาว initial key = 32, round-trip ทุกขนาด key, ขนาดแพ็กเก็ต bootstrap ตรง browser capture |
-| `protocol.rs` | ขนาด schema (526/50/48/344/356/356), outer frame, response frame, FILETIME, round-trip, ค่าเกินช่วง |
-| `parsers.rs` | glob/group mask, timestamp coercion, tick normalisation + cache merge, bars (รวม layout กำกวม), counted records, book, volume/stops validation (รวมการแปลง wire→lots), open-account, account response |
-| `validation.rs`, `rate_limiter.rs`, `order_manager.rs`, `account.rs` | ตามชื่อ |
+| `helpers.rs` | hex, UTF-16LE round trip (incl. Thai text), ASCII padding, client id |
+| `crypto.rs` | 32-byte initial key, round trip for all key sizes, bootstrap packet sizes equal the browser capture |
+| `protocol.rs` | schema sizes (526/50/48/344/356/356), outer/response frames, FILETIME, round trips, out-of-range integers |
+| `parsers.rs` | glob and group masks, timestamps, tick normalisation (with and without), tick cache merge, bars incl. the ambiguous 336-byte case, counted records, order book, volume/stops validation incl. wire-to-lots conversion, open-account results, account response, **trade result push v2**, **cmd 10 push layouts (v2, 736 B, legacy)** |
+| `push_handlers.rs` | live position/order state following pushes (open, resize, close, placed, cancel requested, deleted, history) |
+| `order_helpers.rs` | price normalisation, `trade_action`/filling per execution mode |
+| `currency.rs` | cent currency split |
+| `validation.rs`, `rate_limiter.rs`, `order_manager.rs`, `account.rs` | as named |
 
-เทสต์ที่ "ล็อกพฤติกรรมของ pymt5" โดยตั้งใจ: `tick_price_normalisation` (เช่น `2000.0, digits=2 → 20.0`), `account_response_derived_fields`
+Some tests deliberately pin pymt5 behaviour (e.g. `2000.0` with `digits = 2` normalises to `20.0`; the empty trade-settings quirk).
 
-## 3. Integration tests กับ mock server (`tests/mock_server.rs`)
+## 3. Integration tests with the mock server (`tests/mock_server.rs`)
 
-mock รันใน process เดียวกัน (`TcpListener` + `tokio_tungstenite::accept_async`) และ **พูดโปรโตคอลจริง**: ถอดรหัสด้วย initial key,
-ตอบ bootstrap (ส่ง session key 32 B แล้วสลับ cipher) จากนั้นจัดการ command ตาม `match cmd`:
+The mock runs in-process (`TcpListener` + `tokio_tungstenite::accept_async`) and speaks the real protocol: it decrypts with the initial key, answers the bootstrap
+with a session key and then switches ciphers. A `match cmd` serves:
 
-| cmd | mock ตอบ |
+| cmd | answer |
 |---|---|
-| 0 | `build 6182 ‖ token ‖ key` |
-| 28 | ตรวจ payload = 912 B; ตอบ token+session 777 (หรือ code 3 ถ้า `reject_login`) |
-| 3 | account (balance 1000.5, USD, 1:100, demo) + trade settings 1 รายการ |
-| 34 | symbols 2 ตัว (EURUSD id1 digits5, USDJPY id2) บีบอัด zlib |
-| 7 | บันทึกชุด id; ตอบ ack แล้ว push tick 2 เฟรม (ราคา scaled, ตัวที่สอง bid=0) |
-| 18 | ตรวจรูป `[n][ids]`; ถ้าไม่ใช่ตอบ `code=1` (จำลองพฤติกรรม build 6182); ตอบ full symbol พร้อม `trade` (volume min/step/max แบบ wire) |
-| 4 | positions/orders ว่าง |
-| 12 | trade response retcode 10009 |
-| อื่น ๆ | ack ว่าง; `ignore_cmd` = ไม่ตอบ (ทดสอบ timeout) |
+| 0 | `build 6182 | token | key` |
+| 28 | checks the payload is 912 B; token + session 777, or `code 3` (`reject_login`) |
+| 3 | account (balance 1000.5, USD, 1:100, demo) with one trade-settings record |
+| 34 | two symbols, zlib compressed |
+| 7 | ack, then two tick pushes (scaled prices; the second has `bid = 0`) |
+| 18 | requires `[n][ids]` (else `code = 1`, like build 6182); full symbol with `trade_exemode 2`, fill flags 3, wire volume limits |
+| 4 | one position (id 900) and one order (id 901) plus the 12-byte trailer |
+| 12 | checks the 248-byte layout; validity rules of a market-execution server (see below); 4-byte ack then cmd 19 push(es) |
+| other | empty ack; `ignore_cmd` = no answer (timeouts) |
 
-`Behavior` ปรับพฤติกรรมได้: `reject_login`, `drop_after_login_once` (ปิด socket หลัง login ครั้งแรก), `ignore_cmd`, ตัวนับ `logins/connections`, รายการ `subscribes`
+cmd 12 validity rules in the mock: `action 3` with `type_flags 2` and filling 0/1 (open) or `type_flags 3` with a position (close); `5` with filling 2 and flags 2; `6` with a position;
+`7`/`8` with an order and volume; `10` with both positions; filling `7` -> `10030`; anything else (including the old pymt5 style `action 1`) -> `10013`.
+`Behavior.trade_mode`: 0 = ack + push (6182 style), 1 = legacy full response, 2 = ack only (timeout test). `Behavior.requests` records every cmd 12 payload so tests can assert field offsets.
 
-| เทสต์ | พิสูจน์อะไร |
+| test | proves |
 |---|---|
-| `handshake_login_ping_logout` | handshake เข้ารหัส, login, ping, health, close |
-| `login_rejection_is_authentication_error` | `code=3` → `Error::Authentication` |
-| `account_symbols_ticks_and_trade` | parse account/symbols/ticks (normalise + carry-forward), subscribe merge, managed handle, full symbol, **`order_check` หน่วย volume/margin/no-money**, ส่งออเดอร์ (mock) |
-| `command_timeout_and_transport_not_ready` | `Error::Session` ก่อน connect, `Error::Timeout` แล้ว connection ยังใช้ต่อได้ |
-| `disconnect_callback_and_auto_reconnect_restores_subscriptions` | หลุด → callback → reconnect → re-login → listener ยังอยู่ |
-| `panicking_push_callback_does_not_kill_receive_loop` | panic ใน callback ถูกจับ ไม่ฆ่า recv task |
-| `login_payload_matches_browser_capture_sizes` | ขนาดเฟรม login 916/928/936 |
+| `handshake_login_ping_logout` | encrypted handshake, login, ping, health, close |
+| `login_rejection_is_authentication_error` | `code = 3` -> `Error::Authentication` |
+| `account_symbols_ticks_and_trade` | account/symbol/tick parsing, subscribe merging, managed handle, full symbol, local margin, `order_check` units/margin/no-money, trade results incl. async rejection and typed events |
+| `order_helpers_build_web_terminal_requests` | action/filling/flags per helper, lookups for close/cancel/modify/SLTP, `order_send` dispatch, old style rejected |
+| `trade_result_legacy_immediate_and_timeout` | legacy servers; ack without push -> `Error::Timeout` |
+| `command_timeout_and_transport_not_ready` | `Error::Session` before connect; `Error::Timeout`, connection stays usable |
+| `disconnect_callback_and_auto_reconnect_restores_subscriptions` | drop -> callback -> reconnect -> re-login -> listeners still attached |
+| `panicking_push_callback_does_not_kill_receive_loop` | panics are contained |
+| `login_payload_matches_browser_capture_sizes` | 916/928/936 byte frames |
 
-### เขียนเทสต์ใหม่กับ mock
+### Extending the mock
 
-1. เพิ่ม arm ใน `serve_connection` สำหรับ command ที่ต้องการ (ใช้ `frame(&cipher, cmd, code, &body)` ส่งกลับ)
-2. สร้าง body ด้วย `record_bytes(SCHEMA, FIELD_NAMES, &[("field", Value::…)])` — field ที่ไม่ระบุเป็น 0/ว่าง
-3. ถ้าต้องการ push ให้ `ws.send` เฟรมเพิ่มหลังตอบ
-4. อย่าลืมกฎ: **ต้องตอบด้วย command id เดียวกับ request** (transport จับคู่ด้วย command)
+1. Add an arm to `serve_connection` (reply with `frame(&cipher, cmd, code, &body)`; the reply **must use the request's command id**).
+2. Build bodies with `record_bytes(SCHEMA, NAMES, &[("field", Value::...)])` (unspecified fields are zero/empty).
+3. For pushes, `ws.send` additional frames after the reply.
 
-## 4. Live check (เซิร์ฟเวอร์จริง)
+## 4. Live and demo checks
+
+All read-only unless stated; **none prints the password**.
 
 ```bash
-LOGIN=123456 PASSWORD=... SERVER=wss://host/terminal cargo run --example live_check
+# read-only connectivity check (login, account, symbols, groups, positions, history, bars, ticks, health)
+LOGIN=... PASSWORD=... SERVER=wss://host/terminal cargo run --example live_check
+
+# trading round trip on a DEMO account (refuses non-demo accounts): market open, SL/TP, close, pending place/modify/cancel
+DEMO_LOGIN=... DEMO_PASSWORD=... DEMO_SERVER=wss://host/terminal SYMBOL=EURUSDc cargo run --example demo_trade_check
 ```
 
-ทำเฉพาะการอ่าน: connect → login → account → symbols → groups → positions/orders → history → full symbol info → bars H1 5 วัน → subscribe tick 8 วินาที → health → close.
-**ไม่ส่งออเดอร์ และไม่พิมพ์รหัสผ่าน.** ตัวอย่างผล (build 6182, บัญชีจริงยอดเล็ก): symbols 968, groups 13, history deals 3 053, ping ≈ 106 ms
+### Lessons from live testing (read before debugging "protocol" problems)
 
-### ข้อควรระวัง (เรียนรู้จากการพัฒนา)
+* A login `code=3` repeated: **stop retrying** (account lock risk) and check the credentials. A `#` in the value of an env var/`.env` file often truncates it.
+* Environment variables are read when the process/session starts; changing them later has no effect on a running session.
+* Behind a TLS-intercepting proxy set `SSL_CERT_FILE` or `ClientConfig::ca_bundle` (never disable verification).
+* No ticks = market closed; test with a 24/7 crypto symbol.
+* cmd 4 results are stale after login; use the live state ([trading.md](trading.md)). Right after a trade allow a moment for the push.
+* Different servers differ: the demo server sends scaled-integer ticks, the live one real prices; account currencies can be cents (USC).
+* Always clean up after demo tests (close positions, cancel orders); the examples do.
+* Never commit credentials; before committing run `grep -rIF "$PASSWORD" .` (it must find nothing).
 
-* **อย่า login ซ้ำรัว ๆ เมื่อได้ `code=3`** — อาจทำให้บัญชีโดนล็อก ตรวจข้อมูลก่อน
-* `#` ใน ENV/`.env` มักถูกตัดเป็น comment → รหัสผ่านสั้นกว่าจริง (ตรวจด้วยความยาว ไม่ต้องพิมพ์ค่า)
-* ENV ถูกอ่านตอนเริ่ม session — แก้ระหว่างทางไม่มีผลกับ process ที่รันอยู่
-* เครือข่ายที่ re-terminate TLS ต้องชี้ `SSL_CERT_FILE`/`ClientConfig::ca_bundle` ไปที่ CA bundle (ไม่ใช่ปิด verification)
-* ตลาดปิด = ไม่มี tick (ทดสอบ tick ด้วย crypto ที่เปิด 24/7 เช่น `BTCUSDp`)
-* อย่า commit รหัสผ่าน/login — `.gitignore` มี `.env` แล้ว; ก่อน commit ควร `grep -rF "$PASSWORD" .` ว่าไม่พบ
+## 5. Not yet verified against a real server
 
-## 5. สิ่งที่ยังไม่ได้ทดสอบกับเซิร์ฟเวอร์จริง
-
-ส่งออเดอร์/แก้/ยกเลิก, order book (DOM), push cmd 10/13/14/15/17/19, spreads, เปิดบัญชี, เปลี่ยนรหัส, OTP, cmd 6 (ไม่บีบอัด), cmd 52
-(ดูสถานะรายคำสั่งใน [reference/commands.md](reference/commands.md))
+Partial close, close-by (hedging), stop-limit orders, instant/exchange execution modes, DOM, push cmd 13/14/15/17, spreads, account opening, password change, OTP, cmd 6,
+cmd 52, and a standard USD account (a USD demo account is planned; see [contributing.md](contributing.md#6-open-work)). Per-command status: [reference/commands.md](reference/commands.md).

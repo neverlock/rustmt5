@@ -1,110 +1,100 @@
 # Architecture
 
-## 1. ชั้นของระบบ
+## 1. Layers
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│ Mt5Client  (src/client.rs + impl blocks ในไฟล์อื่น)                │
-│   account · market_data · currency · trading · order_helpers ·     │
-│   push_handlers       ← คือ "mixin" ของ Python กลายเป็น impl block │
-├────────────────────────────────────────────────────────────────────┤
-│ Transport  (src/transport.rs)                                      │
-│   WebSocket · state machine · FIFO pending · listeners · rate limit│
-├────────────────────────────────────────────────────────────────────┤
-│ AesCipher  (src/crypto.rs)   AES-CBC, IV=0, PKCS7                  │
-├────────────────────────────────────────────────────────────────────┤
-│ protocol   (src/protocol.rs) framing + SeriesCodec + Value/Record  │
-└────────────────────────────────────────────────────────────────────┘
-        ↑ ใช้ร่วม: constants · schemas(generated) · parsers · helpers
++--------------------------------------------------------------------+
+| Mt5Client  (src/client.rs + impl blocks in the other files)        |
+|   account | market_data | currency | trading | order_helpers |     |
+|   push_handlers          <- pymt5's mixins became impl blocks      |
++--------------------------------------------------------------------+
+| Transport  (src/transport.rs)                                      |
+|   WebSocket | state machine | FIFO pending | listeners | rate limit|
++--------------------------------------------------------------------+
+| AesCipher  (src/crypto.rs)   AES-CBC, IV = 0, PKCS7                |
++--------------------------------------------------------------------+
+| protocol   (src/protocol.rs) framing + SeriesCodec + Value/Record  |
++--------------------------------------------------------------------+
+        shared: constants | schemas (generated) | parsers | helpers
 ```
 
-ทิศทางการพึ่งพาเป็นบนลงล่างเท่านั้น: `Transport` ไม่รู้จัก `Mt5Client`
-(การแจ้ง disconnect ทำผ่าน callback `set_on_disconnect`) ทำให้ทดสอบ transport ได้เดี่ยว ๆ
+Dependencies only point downwards: `Transport` does not know `Mt5Client` (disconnects are reported through a callback),
+so the transport can be tested alone.
 
-## 2. แผนผังไฟล์
+## 2. File map
 
-| ไฟล์ | หน้าที่ | พอร์ตจาก (Python) |
+| File | Responsibility | pymt5 origin |
 |---|---|---|
-| `lib.rs` | re-export สาธารณะ, doc หน้าแรก | `__init__.py` |
-| `constants.rs`, `constants_gen.rs` | command id, order/trade constants, retcode text, calc-mode sets (gen = สร้างอัตโนมัติ) | `constants.py` |
-| `schemas.rs` | schema + ชื่อ field ของทุก record (**generated**) | `schemas.py`, ส่วนหนึ่งของ `types.py` |
+| `lib.rs` | public re-exports, crate docs | `__init__.py` |
+| `constants.rs`, `constants_gen.rs` | command ids, trade constants, retcode text, calc-mode sets (`_gen` is generated) | `constants.py` |
+| `schemas.rs` | schemas + field names (**generated**) | `schemas.py`, part of `types.py` |
 | `protocol.rs` | `PropType/Field`, `Value/Record`, `SeriesCodec`, framing | `protocol.py` |
-| `helpers.rs` | hex, UTF-16LE, ASCII pad, client-id (SHA-1) | `helpers.py` |
+| `helpers.rs` | hex, UTF-16LE, ASCII padding, client id | `helpers.py` |
 | `crypto.rs` | `AesCipher`, initial key | `crypto.py` |
 | `transport.rs` | `Transport`, `TransportState`, `CommandResult` | `transport.py` |
-| `rate_limiter.rs` | token bucket | `_rate_limiter.py` |
-| `metrics.rs` | trait `MetricsCollector` | `_metrics.py` |
-| `error.rs` | enum `Error` | `exceptions.py` |
-| `types.rs` | `TradeResult`, `AccountInfo`, `SymbolInfo`, request/event structs | `types.py`, `events.py` |
-| `validation.rs` | validate_volume/price/symbol/state | `_validation.py` |
-| `parsers.rs` | parse ตอบกลับ, tick normalisation, glob, validate order | `_parsers.py` |
-| `client.rs` | `Mt5Client` core: config, login, heartbeat, reconnect, health | `client.py` |
-| `account.rs` | บัญชี/รหัสผ่าน/เปิดบัญชี/OTP | `_account.py` |
-| `market_data.rs` | symbols, ticks, book, rates, copy_* | `_market_data.py` |
-| `currency.rs` | แปลงสกุลเงิน, สูตร profit/margin | `_currency.py` |
-| `trading.rs` | positions/orders/history, trade_request, order_send/check | `_trading.py` |
-| `order_helpers.rs` | buy_market … cancel_pending_order | `_order_helpers.py` |
-| `push_handlers.rs` | `on_*`, cache tick/book | `_push_handlers.py` |
-| `subscription.rs` | `SubscriptionHandle` | `_subscription.py` |
-| `order_manager.rs` | `OrderManager` | `_order_manager.py` |
-| `pool.rs` | `Mt5ConnectionPool` | `_pool.py` |
+| `rate_limiter.rs`, `metrics.rs`, `error.rs`, `validation.rs` | token bucket, metrics trait, `Error`, input checks | `_rate_limiter.py`, `_metrics.py`, `exceptions.py`, `_validation.py` |
+| `types.rs` | `TradeResult`, `AccountInfo`, `SymbolInfo`, requests, events | `types.py`, `events.py` |
+| `parsers.rs` | response parsers, tick normalisation, glob, order validation, push layouts | `_parsers.py` |
+| `client.rs` | `Mt5Client` core: config, login, heartbeat, reconnect, health, live state | `client.py` |
+| `account.rs` | account info, passwords, account opening, OTP | `_account.py` |
+| `market_data.rs` | symbols, ticks, book, bars, `copy_*` | `_market_data.py` |
+| `currency.rs` | currency conversion, profit/margin formulas, `account_margin` | `_currency.py` |
+| `trading.rs` | positions/orders, history, `trade_request`, `order_send`, `order_check` | `_trading.py` |
+| `order_helpers.rs` | `buy_market` ... `cancel_pending_order` (execution-mode aware) | `_order_helpers.py` |
+| `push_handlers.rs` | `on_*` handlers, tick/book caches, live trade state | `_push_handlers.py` |
+| `subscription.rs`, `order_manager.rs`, `pool.rs` | handles, order tracker, multi-account pool | `_subscription.py`, `_order_manager.py`, `_pool.py` |
 
-## 3. Data flow (หนึ่ง request/response)
+## 3. Data flow of one request
 
 ```
-caller ──► Mt5Client::get_account()
-              │ build payload (SeriesCodec::serialize)
-              ▼
-          Transport::send_command(cmd, payload)
-              │ 1 rate_limiter.acquire()
-              │ 2 lock sink (serialise การส่ง)
-              │ 3 push (id, oneshot::Sender) เข้า pending[cmd]   ← FIFO ต่อ command
-              │ 4 inner = random(2)+cmd(u16)+payload → AES encrypt → pack_outer → ws.send
-              │ 5 await oneshot ด้วย timeout
-              ▼
-        recv task (loop อ่าน ws)
-              │ unpack_outer → decrypt → parse_response_frame
-              │ dispatch: ปลุก waiter ตัวแรกของ pending[cmd]  + เรียก listeners[cmd] ทุกตัว
-              ▼
-          caller ◄── CommandResult { command, code, body }
-              │ parse body (parsers.rs) → Record / struct
+caller -> Mt5Client::get_account()
+            | build payload (SeriesCodec::serialize)
+            v
+        Transport::send_command(cmd, payload)
+            | 1 rate_limiter.acquire()
+            | 2 lock the sink (serialises sends)
+            | 3 push (id, oneshot::Sender) onto pending[cmd]            <- FIFO per command
+            | 4 inner = random(2) + cmd(u16) + payload -> AES -> pack_outer -> ws.send
+            | 5 await the oneshot with a timeout
+            v
+      recv task (loops on the WebSocket)
+            | unpack_outer -> decrypt -> parse_response_frame
+            | dispatch: wake the first live waiter of pending[cmd] AND call every listener of cmd
+            v
+        caller <- CommandResult { command, code, body }
+            | parse body (parsers.rs) -> Record / struct
 ```
 
-จุดสำคัญ: **response ไม่มี request id** เซิร์ฟเวอร์จับคู่ด้วย *เลข command* เท่านั้น
-จึงต้องใช้คิว FIFO ต่อ command (คำสั่งเดียวกันสองตัวที่ส่งซ้อนกันจะได้คำตอบตามลำดับ)
-และ push ที่ใช้ command เดียวกับ response (เช่น cmd 4, 14) จะถูกส่งให้ทั้ง waiter และ listeners
+Responses carry **no request id**: they are matched by command number only, hence the per-command FIFO. Pushes that share a
+command number with a response (cmd 4, 14) reach both the waiter and the listeners. Trading adds its own correlation
+(`action_id`, see [trading.md](trading.md)).
 
-## 4. โมเดล concurrency
+## 4. Concurrency model
 
-* ใช้ **Tokio** (multi-thread). `Mt5Client` เป็น `Clone` (ภายในเป็น `Arc<Inner>`) ทุก clone ใช้การเชื่อมต่อเดียวกัน
-  จึงส่งเข้า `tokio::spawn` ได้โดยตรง
-* task ที่มีตลอดอายุการเชื่อมต่อ:
-  1. **recv task** (ใน `Transport`) — อ่าน WebSocket, decrypt, dispatch
-  2. **heartbeat task** — `ping` ทุก `heartbeat_interval` (ถือ `Weak<Inner>` เพื่อไม่ยื้อ client ไว้)
-  3. **reconnect task** — เกิดเมื่อหลุดและเปิด `auto_reconnect`
-* **Listener/callback เป็น closure แบบ sync** รันบน recv task → ห้าม block, ห้าม `.await`
-  งานหนักให้ส่งผ่าน channel (`tokio::sync::mpsc`) หรือ `tokio::spawn` เอง
-  ถ้า callback panic จะถูก `catch_unwind` จับ แล้วแจ้ง `on_callback_error` (recv task ไม่ตาย)
+* **Tokio** multi-thread runtime. `Mt5Client` is `Clone` (an `Arc<Inner>`); all clones share one connection.
+* Long-lived tasks: the **recv task** (in `Transport`), the **heartbeat** task and, when enabled, the **reconnect** task.
+* **Listeners are synchronous closures that run on the recv task**: never block or `.await` in them. Hand work to a channel or
+  `tokio::spawn`. A panicking listener is caught (`catch_unwind`) and reported through `on_callback_error`.
 
-## 5. กฎการ lock (สำคัญเมื่อแก้โค้ด)
+## 5. Locking rules (important when editing)
 
-| ตัวแปร | ชนิด | กฎ |
+| State | Type | Rule |
 |---|---|---|
-| `Inner.state` (cache ทั้งหมดของ client) | `std::sync::Mutex<State>` | ถือสั้น ๆ **ห้ามถือข้าม `.await`** ใช้ผ่าน `self.st()` ปล่อยก่อนเรียก callback/await |
-| `Transport.sink` | `tokio::sync::Mutex` | ถือขณะส่งเฟรมเท่านั้น (ทำหน้าที่ send-lock ด้วย) |
-| `Transport.pending / listeners` | `std::sync::Mutex` | ถือเฉพาะตอน push/pop; เรียก listener **นอก** lock (clone `Arc` ออกมาก่อน) |
-| `Transport.cipher` | `std::sync::RwLock` | เปลี่ยนค่าเฉพาะตอน connect (หลัง bootstrap) |
+| `Inner.state` (all client caches and live state) | `std::sync::Mutex<State>` | keep it short, **never across `.await`**; use `self.st()`; release before calling user callbacks |
+| `Transport.sink` | `tokio::sync::Mutex` | held only while sending a frame (it doubles as the send lock) |
+| `Transport.pending` / `listeners` | `std::sync::Mutex` | held only to push/pop; listeners are cloned out and called **outside** the lock |
+| `Transport.cipher` | `std::sync::RwLock` | replaced only during connect (after bootstrap) |
 
-push handler ที่ต้องใช้ cache จะจับ `Arc<Mutex<State>>` (ไม่ใช่ตัว client) เพื่อไม่ให้เกิด reference cycle
-`Mt5Client → Transport → listener → Mt5Client`. ส่วน disconnect callback ใช้ `Weak<Inner>` ด้วยเหตุผลเดียวกัน
+Push handlers that need client state capture the `Arc<Mutex<State>>` (not the client) to avoid the cycle
+`Mt5Client -> Transport -> listener -> Mt5Client`. The disconnect callback uses a `Weak<Inner>` for the same reason.
 
-## 6. ความต่างเชิงโครงสร้างจาก Python
+## 6. Structural differences from pymt5
 
-| Python | Rust | เหตุผล |
+| pymt5 | rustmt5 | Reason |
 |---|---|---|
-| mixin classes | หลาย `impl Mt5Client` ในไฟล์แยก | ภาษาไม่มี inheritance; แยกไฟล์ให้ขนาดดูแลง่ายเหมือนเดิม |
-| `dict` ทุกที่ | `Record` + struct สำหรับ dataclass | คง semantics ของต้นฉบับ แต่ได้ type สำหรับผลลัพธ์ระดับบน |
-| exception (หลายชนิด + multi-inherit) | `enum Error` + `Result` | ดู [types-and-errors.md](types-and-errors.md) |
-| `async with client` | `connect()` / `close()` ตรง ๆ | ไม่มี async `Drop` |
-| callback sync/async | closure sync | ตัดความซับซ้อน; ดูข้อ 4 |
-| reconnect สร้าง Transport ใหม่ | ใช้ Transport เดิม | listener ไม่หาย (ดู [client.md](client.md)) |
+| mixin classes | several `impl Mt5Client` blocks | no inheritance; files stay small |
+| `dict` everywhere | `Record` plus structs for dataclass-like results | keeps pymt5 semantics, typed top-level results |
+| exceptions (multiple inheritance) | `enum Error` + `Result` | see [types-and-errors.md](types-and-errors.md) |
+| `async with client` | explicit `connect()`/`close()` | no async `Drop` |
+| sync or async callbacks | sync closures | simpler; see section 4 |
+| reconnect builds a new transport | reuses the transport | listeners survive ([client.md](client.md)) |

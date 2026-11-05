@@ -2,117 +2,121 @@
 
 ## 1. `ClientConfig`
 
-| field | default | ความหมาย |
+| field | default | meaning |
 |---|---|---|
 | `uri` | `wss://web.metatrader.app/terminal` | WebSocket URL |
-| `timeout` | 30.0 | วินาที — ทั้ง connect และแต่ละ command |
-| `heartbeat_interval` | 30.0 | ระยะ `ping` ของ heartbeat task |
-| `tick_history_limit` | 10 000 | จำนวน tick ที่เก็บต่อ symbol (0 = ไม่จำกัด) |
-| `max_tick_symbols` | 0 | จำนวน symbol สูงสุดที่เก็บ history (0 = ไม่จำกัด; เกินแล้วลบตัวที่ update นานสุด = LRU) |
-| `auto_reconnect` | false | เปิด reconnect อัตโนมัติ |
+| `timeout` | 30.0 | seconds, for connecting and for every command (also the wait for a trade result) |
+| `heartbeat_interval` | 30.0 | seconds between heartbeat pings |
+| `tick_history_limit` | 10 000 | ticks kept per symbol (0 = unlimited) |
+| `max_tick_symbols` | 0 | symbols with tick history (0 = unlimited; beyond that the least recently updated is evicted) |
+| `auto_reconnect` | false | reconnect automatically |
 | `max_reconnect_attempts` | 5 | |
-| `reconnect_delay` / `max_reconnect_delay` | 3.0 / 60.0 | ฐานและเพดานของ backoff |
+| `reconnect_delay` / `max_reconnect_delay` | 3.0 / 60.0 | backoff base and cap |
 | `rate_limit` / `rate_burst` | 0 / 20 | token bucket |
 | `metrics` | None | |
-| `symbol_cache_ttl` | 0 | วินาที; 0 = `load_symbols` ดึงใหม่ทุกครั้ง |
-| `ca_bundle` | None | PEM root CA เพิ่มเติม (ดู [transport.md](transport.md)) |
+| `symbol_cache_ttl` | 0 | seconds; 0 = `load_symbols` always refetches |
+| `ca_bundle` | None | extra PEM root CAs (see [transport.md](transport.md)) |
+| `normalize_ticks` | true | undo the scaled-integer tick price heuristic; set `false` when the server already sends real prices ([market-data.md](market-data.md)) |
 
-`ClientConfig::new(uri)` ตั้ง uri และใช้ค่าอื่นเป็น default
+`ClientConfig::new(uri)` sets the URI and keeps the other defaults.
 
-## 2. `State` (cache ภายใน)
+## 2. Internal `State`
 
-`Inner.state: Arc<Mutex<State>>` เก็บ:
+`Inner.state: Arc<Mutex<State>>` holds:
 
-| field | ใช้ทำ |
+| field | used for |
 |---|---|
-| `symbols` / `symbols_by_id` / `symbols_loaded_at` | cache จาก `load_symbols`; ใช้ map ชื่อ↔id, normalise ราคา tick |
-| `full_symbols` | cache ผล cmd 18 ต่อชื่อ (ล้างเมื่อ `load_symbols` โหลดใหม่) |
-| `tick_cache_by_id/name` | tick ล่าสุด → `symbol_info_tick`, แปลงสกุลเงิน, merge ค่า 0 ("ไม่เปลี่ยน") |
-| `tick_history_by_id` + `tick_history_access_order` | ประวัติ tick (VecDeque) + ลำดับ LRU → `copy_ticks_*` |
-| `book_cache_by_id/name` | DOM ล่าสุด → `market_book_get` |
-| `subscribed_ids`, `subscribed_book_ids` | ชุดที่ subscribe อยู่ (ใช้ซ้ำตอน reconnect) |
-| `logged_in`, `bootstrap_pristine`, `closing` | แฟล็กสถานะ |
-| `login_params` | เก็บข้อมูลล็อกอินไว้ reconnect (ลบเมื่อ `close()`) |
-| `last_error` | `(code, message)` ของ helper แบบ MetaTrader5 (`last_error()`) |
-| `reconnect_count`, `connected_at`, `health_threshold_ms` | health |
+| `symbols`, `symbols_by_id`, `symbols_loaded_at` | `load_symbols` cache; name <-> id; tick normalisation |
+| `full_symbols` | cmd 18 results per name (cleared when `load_symbols` reloads) |
+| `tick_cache_by_id/name`, `tick_history_by_id`, `tick_history_access_order` | latest ticks, merge of unchanged prices, `copy_ticks_*`, LRU |
+| `book_cache_by_id/name` | latest DOM |
+| `subscribed_ids`, `subscribed_book_ids` | current subscriptions, re-sent on reconnect |
+| `live_positions`, `live_orders`, `trade_state_ready` | live trading state (below) |
+| `trade_waiters`, `next_action_id` | correlation of `trade_request` with its cmd 19 pushes |
+| `logged_in`, `bootstrap_pristine`, `closing`, `login_params` | session flags and stored credentials |
+| `last_error`, `reconnect_count`, `connected_at`, `health_threshold_ms`, `normalize_ticks` | misc |
 
-> Python เก็บ tick history สองชุด (by id / by name ชี้ deque เดียวกัน); Rust เก็บชุดเดียวตาม id แล้วหาจากชื่อผ่าน `symbols`
+pymt5 keeps two tick-history maps (by id and by name sharing one deque); Rust keeps one keyed by id and finds it by name through `symbols`.
+
+### Live trading state
+
+`login_with` resets `live_positions`/`live_orders` and, after a successful login, calls `get_positions_and_orders()` once to seed them from the
+server's cmd 4 snapshot (taken at login). From then on cmd 10 pushes update them (`apply_trade_update` in `push_handlers.rs`):
+
+* `update_type 2`: for every POSITION in the push, `trade_volume == 0` removes it, otherwise it is inserted/replaced.
+* `update_type 0`: ORDER with `transaction_type == 2` or a non-live `order_state` (live = 0, 1, 3, 7, 8) is removed; otherwise inserted/replaced.
+* `update_type 1` (history order): the order is final and is removed.
+
+`get_positions_and_orders()` returns this live state (it still sends cmd 4 so the first call seeds it). `reload_positions_and_orders()` discards the
+state and reseeds from a new cmd 4 answer - useful only on servers whose cmd 4 answers are current.
 
 ## 3. Login flow
 
 ```
-connect()           Transport::connect → bootstrap_pristine = true, connected_at = now
-   │
-[init_session()]    cmd 29 (ไม่บังคับ) — bootstrap_pristine = false
-   │
-login(login, pw)    = login_with(LoginParams::new(login, pw))
-   ├ build_login_payload  (912 B)
-   ├ send cmd 28
-   ├ code ≠ 0 → Err(Authentication("login rejected by server: code=N …"))
-   ├ parse LOGIN_RESPONSE → (token_hex, session_id)
-   ├ logged_in = true; เก็บ LoginParams (สำหรับ reconnect)
-   └ ถ้า auto_heartbeat → start_heartbeat()
+connect()          Transport::connect; bootstrap_pristine = true; connected_at = now
+[init_session()]   cmd 29 (optional); bootstrap_pristine = false
+login(login, pw)   = login_with(LoginParams::new(login, pw))
+   - reset live state; build the 912-byte payload; send cmd 28
+   - code != 0 -> Err(Authentication("login rejected by server: code=N ..."))
+   - parse (token, session_id); logged_in = true; store LoginParams (for reconnect)
+   - auto_heartbeat -> start the heartbeat task
+   - seed the live trading state (cmd 4), failures are only logged
 ```
 
-`LoginParams` มี `Debug` ที่ **ซ่อนรหัสผ่าน** (`<redacted>`) — อย่าเปลี่ยนเป็น derive
+`LoginParams` has a custom `Debug` that **redacts the password** - keep it that way. `is_connected()` = `transport.is_ready() && logged_in`.
 
-`is_connected()` = `transport.is_ready() && logged_in`
+### `bootstrap_pristine` and cmd 52
 
-### `bootstrap_pristine` และ cmd 52
-
-บน build 5687 `cmd 52` ปลอดภัยเฉพาะ "ก่อน init/login" (ไม่งั้นเซิร์ฟเวอร์ตัด socket)
-`bootstrap_pristine` = true หลัง connect และเป็น false เมื่อมี `init_session`/`login`/`send_raw_command(28|29|52)`
-`send_bootstrap_command_52` ปฏิเสธถ้าไม่ pristine
+On build 5687 `cmd 52` is only safe before init/login (otherwise the server drops the socket). The flag is set after `connect` and cleared by
+`init_session`, `login` and `send_raw_command(28|29|52)`; `send_bootstrap_command_52` refuses when it is not pristine.
 
 ## 4. Heartbeat
 
-`start_heartbeat` spawn task: วน `sleep(heartbeat_interval)` → `ping()`; ล้มเหลวแค่ log warning
-task ถือ `Weak<Inner>` — เมื่อ client ถูก drop ทั้งหมด task จะจบเอง; `stop_heartbeat` (ตอน logout/close/disconnect) `abort()`
+`start_heartbeat` spawns a task: `sleep(heartbeat_interval)` then `ping()` (failures are logged as warnings). It holds a `Weak<Inner>`, so it ends
+when all clients are dropped; `stop_heartbeat` aborts it on logout/close/disconnect.
 
 ## 5. Reconnect
 
-เริ่มเมื่อ transport แจ้ง disconnect, `auto_reconnect = true`, ไม่ได้อยู่ระหว่าง `close()`, และมี `login_params`:
+Starts when the transport reports a disconnect, `auto_reconnect` is on, `close()` is not running and credentials are stored:
 
 ```
-handle_disconnect():  logged_in=false · หยุด heartbeat · เรียก on_disconnect(user) · spawn reconnect_loop (ถ้ายังไม่มี task วิ่งอยู่)
+handle_disconnect(): logged_in = false | stop heartbeat | call the user's on_disconnect | spawn reconnect_loop (if none is running)
 
 reconnect_loop():
   for attempt in 1..=max_reconnect_attempts:
-      delay = min( base·2^(attempt-1) + U(0, base),  max_delay )
+      delay = min( base * 2^(attempt-1) + U(0, base), max_delay )
       metrics.on_reconnect_attempt; sleep(delay)
-      try:  transport.close(); transport.connect()
-            login_with(stored params, auto_heartbeat=true)
-            subscribe_ticks(subscribed_ids) ; subscribe_book(subscribed_book_ids)
-            reconnect_count += 1; connected_at = now; metrics.on_reconnect_success; return
-      catch: log warning แล้วลองรอบถัดไป
-  หมดรอบ → log error (ไม่มี callback ล้มเหลวสุดท้าย — ดู on_disconnect/health_check)
+      try: transport.close(); transport.connect()
+           login_with(stored params, auto_heartbeat = true)         // also reseeds the live trading state
+           subscribe_ticks(subscribed_ids); subscribe_book(subscribed_book_ids)
+           reconnect_count += 1; metrics.on_reconnect_success; return
+      on error: log and try the next attempt
+  exhausted: log an error (there is no "gave up" callback yet)
 ```
 
-**ต่างจาก Python:** reuse `Transport` เดิมจึง *ไม่เสีย listener* (รวม cache tick/book และ handler ของผู้ใช้).
-Python สร้าง transport ใหม่ ทำให้ listener หายหลัง reconnect (มี integration test
-`disconnect_callback_and_auto_reconnect_restores_subscriptions` ครอบคลุมพฤติกรรมนี้)
-
-ข้อจำกัด: ระหว่าง reconnect, command ที่กำลังรอจะได้ `Error::Connection` ทันที (fail_all)
+**Difference from pymt5:** the same `Transport` is reused, so listeners (the client's caches and user handlers) survive. pymt5 creates a new transport
+and silently loses them (covered by the integration test `disconnect_callback_and_auto_reconnect_restores_subscriptions`).
+Commands in flight when the socket drops fail immediately with `Error::Connection`.
 
 ## 6. `close()`
 
-1. `closing = true` (กัน reconnect), หยุด heartbeat, abort reconnect task
-2. ถ้า `logged_in` → `logout()` (ล้มเหลวก็ข้าม) 
-3. `transport.close()` (fail command ที่ค้างด้วย `Error::Session("transport closed")`)
-4. ล้าง `login_params` (ลบข้อมูลรหัสผ่านออกจากหน่วยความจำ), `closing = false`
+1. `closing = true` (suppresses reconnect), stop the heartbeat, abort the reconnect task.
+2. If logged in: `logout()` (errors ignored).
+3. `transport.close()` (in-flight commands fail with `Error::Session("transport closed")`).
+4. Drop `login_params` (the stored credentials), `closing = false`.
 
 ## 7. Health
 
-`health_check()` → `HealthStatus { state, ping_latency_ms, last_message_age_secs, uptime_seconds, reconnect_count }`
-ถ้า transport พร้อมจะ `ping` วัด latency; ถ้า latency > threshold (ตั้งด้วย `on_health_degraded(cb, threshold_ms)`, default 5000) เรียก callback ที่ลงทะเบียนไว้
+`health_check()` returns `HealthStatus { state, ping_latency_ms, last_message_age_secs, uptime_seconds, reconnect_count }`. When ready it pings to measure
+latency; if latency exceeds the threshold (`on_health_degraded(cb, threshold_ms)`, default 5000) the callbacks run.
 
-## 8. `last_error` (ความเข้ากันกับ MetaTrader5)
+## 8. `last_error` (MetaTrader5 compatibility)
 
-helper แบบ official-style ที่ "ล้มเหลวแบบนุ่มนวล" (`order_calc_profit`, `order_calc_margin`, `order_check`, `version`) คืน `None`/retcode และเก็บ `(code, message)`
-ไว้ให้อ่านด้วย `last_error()` — code ที่ใช้: `-1` action ไม่รองรับ, `-2` ไม่พบ symbol, `-3` ไม่มีสกุลเงินบัญชี, `-4` ไม่มี currency_profit,
-`-5/-6` แปลงสกุลเงินไม่ได้ (profit/margin), `-7` ไม่มี build, `-10…-18` ข้อมูลสูตรไม่พอ (ดู [trading.md](trading.md)), `-99` parse/validation ผิดพลาด
+"Soft failing" official-style helpers (`order_calc_profit`, `order_calc_margin`, `order_check`, `version`) return `None`/a retcode and store `(code, message)`
+readable with `last_error()`: `-1` unsupported action, `-2` symbol not found, `-3` no account currency, `-4` no `currency_profit`, `-5`/`-6` cannot convert
+profit/margin currency, `-7` no build number, `-10..-18` insufficient symbol data for the formulas ([trading.md](trading.md)), `-99` parse/validation error.
 
 ## 9. Escape hatches
 
-* `send_raw_command(cmd, payload)` — ส่ง command ใด ๆ ใน `VALID_COMMANDS` (ใช้ลองคำสั่งใหม่ได้)
-* `transport()` — เข้าถึง `Transport` เพื่อ `on/off` listener ดิบ
+* `send_raw_command(cmd, payload)` - any command in `VALID_COMMANDS` (handy for exploring new commands).
+* `transport()` - raw `on/off` listeners.

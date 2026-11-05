@@ -75,6 +75,11 @@ real structs.
 * TLS uses rustls with the built-in web PKI roots. Extra roots (e.g. a corporate / intercepting proxy CA)
   can be added with `ClientConfig::ca_bundle` or the standard `SSL_CERT_FILE` variable. Verification is
   never disabled.
+* **Trading follows the Web Terminal, not pymt5.** Verified on a real demo account (build 6182): the cmd 12 request is 248 bytes, its answer is only an
+  ack and the outcome arrives as cmd 19 pushes (`trade_request` waits for the final one and reports rejections correctly), market orders pick
+  `trade_action`/filling by the symbol's execution mode, and close/cancel/modify look up the existing position or order. Positions/orders are kept
+  live from cmd 10 pushes (the server's cmd 4 answer is a login-time snapshot) and used margin is computed locally. Details in [`docs/trading.md`](docs/trading.md).
+  Use a demo account first (`cargo run --example demo_trade_check` refuses non-demo accounts).
 * Quirks of the original are preserved on purpose, e.g. an empty trade-settings count in the account
   response is not consumed, and `normalize_tick_price_value` heuristics are identical.
 
