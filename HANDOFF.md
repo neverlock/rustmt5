@@ -63,8 +63,8 @@ Record results in `docs/trading.md` (verification status) and `docs/reference/co
 * The demo std account was left with 0 positions / 0 orders (balance about 99159 USD).
 
 **Still open (nothing is half-done in the tree):**
-1. More broker margin comparisons: stocks/indices (calc mode 2, other rules), BTCUSDs above 2 lots (second tier), forex/metals (mode 0, `margin_rates_initial` = 1.0 so far), a symbol with `margin_hedged != 0`.
-2. `order_calc_margin` prices one order and ignores netting against existing opposite positions (it only uses same-side volume as the tier start).
+1. More broker margin comparisons (model predictions on 2026-11-05 prices, to compare with the terminal: BTCUSDs 3.00 lot ~8685 (2 lots at 0.04 + 1 lot at 1.0 - unverified), US30s 0.10 lot ~267.9, EURUSDs 0.10 ~5.63, XAUUSDs 0.10 ~20.59): stocks/indices (calc mode 2, other rules), BTCUSDs above 2 lots (second tier), forex/metals (mode 0, `margin_rates_initial` = 1.0 so far), a symbol with `margin_hedged != 0`.
+2. DONE: `order_margin_impact(action, symbol, volume, price)` = margin(all positions + the order) - margin(now), so it nets against opposite positions and uses cumulative tiers. `order_calc_margin` stays the MT5-style isolated calculation (its tier start uses same-side volume). Read-only check on the empty account: both agree (BTCUSDs 0.01 = 3.2167).
 3. Live run of the HTTP proxy; live run with `margin_hedged != 0`.
 4. Instant/exchange execution modes: never seen on this server (code paths only unit-tested).
 5. Position `profit` re-pricing ignores commission/swap (same as the push values); the cmd 14 account push was never observed.

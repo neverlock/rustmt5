@@ -272,6 +272,33 @@ impl Mt5Client {
         Ok(Some(raw * if is_buy { rate_buy } else { rate_sell }))
     }
 
+    /// Extra margin the account would need if this market order were opened now: margin of all positions plus the new
+    /// one minus the current margin. Unlike [`order_calc_margin`](Self::order_calc_margin) (one order in isolation, as in
+    /// MT5) it accounts for netting against opposite positions and for the cumulative-volume leverage tiers.
+    /// `None` + `last_error()` when the order cannot be priced.
+    pub async fn order_margin_impact(&self, action: i64, symbol: &str, volume: f64, price: f64) -> Result<Option<f64>> {
+        let Some(is_buy) = order_side(action) else {
+            self.fail_last_error(-1, format!("unsupported action for order_margin_impact(): {action}"));
+            return Ok(None);
+        };
+        crate::validation::validate_volume(volume)?;
+        let account = self.get_account().await?;
+        let before = self.account_margin_from(&account).await?;
+        let extra = Record::new()
+            .with("position_id", 0u64)
+            .with("trade_symbol", symbol)
+            .with("trade_volume", Self::volume_to_lots(volume, self.volume_precision()).max(0) as u64)
+            .with("trade_action", if is_buy { POSITION_TYPE_BUY } else { POSITION_TYPE_SELL })
+            .with("price_open", price);
+        let after = self.account_margin_with(&account, Some(extra)).await?;
+        if after.get_f64("unpriced") > before.get_f64("unpriced") {
+            self.fail_last_error(-7, format!("unable to price the margin of {symbol}"));
+            return Ok(None);
+        }
+        self.clear_last_error();
+        Ok(Some(after.get_f64("margin") - before.get_f64("margin")))
+    }
+
     /// Send a raw trade request (cmd=12) after local sanity checks.
     pub async fn trade_request(&self, r: &TradeRequest) -> Result<TradeResult> {
         let a = r.trade_action;

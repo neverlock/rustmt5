@@ -211,9 +211,16 @@ impl Mt5Client {
     }
 
     pub(crate) async fn account_margin_from(&self, account: &Record) -> Result<Record> {
+        self.account_margin_with(account, None).await
+    }
+
+    /// [`Self::account_margin`] with an optional hypothetical extra position (`trade_symbol`, `trade_volume` in wire
+    /// units, `trade_action`, `price_open`) added to the live ones.
+    pub(crate) async fn account_margin_with(&self, account: &Record, extra: Option<Record>) -> Result<Record> {
         let leverage = account.get_i64("leverage");
         let account_ccy = account.get_str("currency").to_string();
-        let positions: RecordList = self.get_positions().await?;
+        let mut positions: RecordList = self.get_positions().await?;
+        if let Some(e) = extra { positions.push(e); }
         let (mut margin, mut floating, mut unpriced) = (0.0f64, 0.0f64, 0usize);
         // per symbol: spec + (buy lots, buy margin value, sell lots, sell margin value, hedged cost per lot);
         // "margin value" = leveraged margin in account currency BEFORE the margin-rate/tier factor
