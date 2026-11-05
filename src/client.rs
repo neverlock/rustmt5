@@ -53,6 +53,8 @@ pub struct ClientConfig {
     /// (defaults to the `SSL_CERT_FILE` environment variable when unset).
     /// HTTP `CONNECT` proxy for the WebSocket, `http://[user:pass@]host:port`. `None` = direct TCP (the default).
     pub proxy: Option<String>,
+    /// Supply the WebSocket yourself (e.g. a browser-impersonating TLS stack) instead of the built-in rustls one.
+    pub link_connector: Option<Arc<dyn crate::transport::LinkConnector>>,
     /// Decimal places of wire volumes (`lots * 10^n`). 8 on every server seen so far (0.01 lot = 1_000_000).
     pub volume_precision: i32,
     pub ca_bundle: Option<std::path::PathBuf>,
@@ -79,6 +81,7 @@ impl Default for ClientConfig {
             symbol_cache_ttl: 0.0,
             ca_bundle: None,
             proxy: None,
+            link_connector: None,
             volume_precision: crate::constants::VOLUME_PRECISION,
             normalize_ticks: true,
         }
@@ -187,6 +190,7 @@ impl Mt5Client {
     pub fn new(config: ClientConfig) -> Self {
         let transport = Transport::with_options(config.uri.clone(), config.timeout, config.rate_limit, config.rate_burst, config.metrics.clone(), config.ca_bundle.clone());
         transport.set_proxy(config.proxy.clone());
+        transport.set_link_connector(config.link_connector.clone());
         let state = Arc::new(Mutex::new(State { health_threshold_ms: 5000.0, normalize_ticks: config.normalize_ticks, next_action_id: 1, ..Default::default() }));
         let client = Self {
             inner: Arc::new(Inner {

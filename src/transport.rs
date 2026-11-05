@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -28,6 +28,34 @@ use crate::rate_limiter::TokenBucketRateLimiter;
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<Ws, Message>;
 type WsStream = SplitStream<Ws>;
+
+/// Event delivered by an externally supplied socket (see [`LinkConnector`]).
+pub enum LinkEvent {
+    /// One complete binary WebSocket message.
+    Binary(Vec<u8>),
+    /// The socket is closed or failed; the string is the reason.
+    Closed(String),
+}
+
+/// A connected socket supplied by the embedding application: binary messages out through `tx`, messages
+/// in through `rx`. Dropping `tx` must close the socket. Ping/pong handling is the connector's job.
+pub struct Link {
+    pub tx: mpsc::Sender<Vec<u8>>,
+    pub rx: mpsc::Receiver<LinkEvent>,
+}
+
+pub type LinkFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<Link, String>> + Send + 'a>>;
+
+/// Replaces the built-in tokio-tungstenite/rustls connection (for example with a browser-impersonating
+/// TLS stack). `uri` is the configured WebSocket URL; the connector must send the usual `Origin` header.
+pub trait LinkConnector: Send + Sync {
+    fn connect<'a>(&'a self, uri: &'a str) -> LinkFuture<'a>;
+}
+
+enum Sink {
+    Ws(WsSink),
+    Chan(mpsc::Sender<Vec<u8>>),
+}
 
 /// Connection lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +100,8 @@ struct Inner {
     uri: String,
     timeout: Duration,
     state: Mutex<TransportState>,
-    sink: AsyncMutex<Option<WsSink>>,
+    sink: AsyncMutex<Option<Sink>>,
+    link_connector: Mutex<Option<Arc<dyn LinkConnector>>>,
     cipher: RwLock<AesCipher>,
     token: Mutex<Vec<u8>>,
     pending: Mutex<HashMap<u16, VecDeque<(u64, Waiter)>>>,
@@ -113,6 +142,7 @@ impl Transport {
                 timeout: Duration::from_secs_f64(timeout_secs),
                 state: Mutex::new(TransportState::Disconnected),
                 sink: AsyncMutex::new(None),
+                link_connector: Mutex::new(None),
                 cipher: RwLock::new(initial_cipher()),
                 token: Mutex::new(vec![0; DEFAULT_TOKEN_LENGTH]),
                 pending: Mutex::new(HashMap::new()),
@@ -167,6 +197,9 @@ impl Transport {
     /// Route the WebSocket through an HTTP `CONNECT` proxy (`http://[user:pass@]host:port`); `None` = direct.
     pub fn set_proxy(&self, proxy: Option<String>) { *self.inner.proxy.lock().unwrap() = proxy; }
 
+    /// Use an externally supplied socket instead of the built-in tungstenite connection.
+    pub fn set_link_connector(&self, connector: Option<Arc<dyn LinkConnector>>) { *self.inner.link_connector.lock().unwrap() = connector; }
+
     pub async fn connect(&self) -> Result<()> {
         if self.inner.sink.lock().await.is_some() {
             self.close().await;
@@ -211,6 +244,18 @@ impl Transport {
 
     async fn connect_inner(&self) -> Result<()> {
         let uri = &self.inner.uri;
+        let external = self.inner.link_connector.lock().unwrap().clone();
+        if let Some(connector) = external {
+            let link = tokio::time::timeout(self.inner.timeout, connector.connect(uri))
+                .await
+                .map_err(|_| Error::Connection { message: format!("connect timed out after {:?}", self.inner.timeout), server_uri: uri.clone() })?
+                .map_err(|message| Error::Connection { message, server_uri: uri.clone() })?;
+            let Link { tx, rx } = link;
+            *self.inner.sink.lock().await = Some(Sink::Chan(tx));
+            let this = self.clone();
+            *self.inner.recv_task.lock().unwrap() = Some(tokio::spawn(async move { this.recv_loop_link(rx).await }));
+            return self.bootstrap().await;
+        }
         let mut req = uri.as_str().into_client_request()?;
         req.headers_mut().insert("Origin", "https://web.metatrader.app".parse().unwrap());
         let cfg = WebSocketConfig::default().max_message_size(None).max_frame_size(None);
@@ -235,11 +280,14 @@ impl Transport {
             .map_err(|_| Error::Connection { message: format!("connect timed out after {:?}", self.inner.timeout), server_uri: uri.clone() })?
             .map_err(|message| Error::Connection { message, server_uri: uri.clone() })?;
         let (sink, stream) = ws.split();
-        *self.inner.sink.lock().await = Some(sink);
+        *self.inner.sink.lock().await = Some(Sink::Ws(sink));
         let this = self.clone();
         *self.inner.recv_task.lock().unwrap() = Some(tokio::spawn(async move { this.recv_loop(stream).await }));
-        debug!("websocket open, sending bootstrap");
+        self.bootstrap().await
+    }
 
+    async fn bootstrap(&self) -> Result<()> {
+        debug!("websocket open, sending bootstrap");
         let token = self.inner.token.lock().unwrap().clone();
         let bootstrap = self.send_raw(CMD_BOOTSTRAP, &token, false).await?;
         if bootstrap.code != 0 {
@@ -263,8 +311,10 @@ impl Transport {
             t.abort();
             let _ = t.await;
         }
-        if let Some(mut sink) = self.inner.sink.lock().await.take() {
-            let _ = sink.close().await;
+        match self.inner.sink.lock().await.take() {
+            Some(Sink::Ws(mut sink)) => { let _ = sink.close().await; }
+            Some(Sink::Chan(tx)) => drop(tx), // dropping the sender closes the external socket
+            None => {}
         }
     }
 
@@ -301,9 +351,14 @@ impl Transport {
             self.inner.pending.lock().unwrap().entry(command).or_default().push_back((id, tx));
             let encrypted = self.inner.cipher.read().unwrap().encrypt(&build_command(command, payload));
             debug!("send cmd={} payload={} bytes", command, payload.len());
-            if let Err(e) = sink.send(Message::Binary(pack_outer(&encrypted).into())).await {
+            let framed = pack_outer(&encrypted);
+            let sent = match sink {
+                Sink::Ws(ws) => ws.send(Message::Binary(framed.into())).await.map_err(Error::from),
+                Sink::Chan(tx) => tx.send(framed).await.map_err(|_| Error::connection("external socket closed")),
+            };
+            if let Err(e) = sent {
                 self.remove_pending(command, id);
-                return Err(e.into());
+                return Err(e);
             }
             if let Some(m) = &self.inner.metrics { m.on_command_sent(command); }
         }
@@ -339,6 +394,25 @@ impl Transport {
                 Err(e) => { reason = e.to_string(); break; }
             }
         }
+        self.finish_recv(reason);
+    }
+
+    async fn recv_loop_link(self, mut rx: mpsc::Receiver<LinkEvent>) {
+        let mut reason = String::from("connection closed by server");
+        while let Some(event) = rx.recv().await {
+            match event {
+                LinkEvent::Binary(data) => {
+                    if let Err(e) = self.handle_frame(&data) {
+                        error!("recv_loop parse error: {e}");
+                    }
+                }
+                LinkEvent::Closed(r) => { reason = r; break; }
+            }
+        }
+        self.finish_recv(reason);
+    }
+
+    fn finish_recv(&self, reason: String) {
         if self.inner.shutdown.load(Ordering::SeqCst) {
             return;
         }

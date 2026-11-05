@@ -51,5 +51,5 @@ pub use protocol::{Record, RecordList, Value};
 pub use push_handlers::TradeUpdate;
 pub use subscription::SubscriptionHandle;
 pub use trading::{HistoryFilter, PositionsAndOrders, TradeHistory, TradeRequest};
-pub use transport::{CommandResult, Transport, TransportState};
+pub use transport::{CommandResult, Link, LinkConnector, LinkEvent, LinkFuture, Transport, TransportState};
 pub use types::*;

@@ -586,3 +586,47 @@ async fn order_helpers_build_web_terminal_requests() {
     assert_eq!((bad.retcode, bad.success), (10013, false));
     c.close().await;
 }
+
+/// Reference `LinkConnector`: a plain tungstenite socket driven through the channel interface.
+struct ChannelConnector;
+
+impl rustmt5::LinkConnector for ChannelConnector {
+    fn connect<'a>(&'a self, uri: &'a str) -> rustmt5::LinkFuture<'a> {
+        Box::pin(async move {
+            let (ws, _) = tokio_tungstenite::connect_async(uri).await.map_err(|e| e.to_string())?;
+            let (mut sink, mut stream) = ws.split();
+            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (in_tx, in_rx) = tokio::sync::mpsc::channel::<rustmt5::LinkEvent>(64);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        outgoing = out_rx.recv() => match outgoing {
+                            Some(bytes) => { if sink.send(Message::Binary(bytes.into())).await.is_err() { break; } }
+                            None => { let _ = sink.close().await; return; }
+                        },
+                        incoming = stream.next() => match incoming {
+                            Some(Ok(Message::Binary(b))) => { if in_tx.send(rustmt5::LinkEvent::Binary(b.to_vec())).await.is_err() { return; } }
+                            Some(Ok(Message::Close(_))) | None => { let _ = in_tx.send(rustmt5::LinkEvent::Closed("closed".into())).await; return; }
+                            Some(Err(e)) => { let _ = in_tx.send(rustmt5::LinkEvent::Closed(e.to_string())).await; return; }
+                            Some(Ok(_)) => {}
+                        },
+                    }
+                }
+            });
+            Ok(rustmt5::Link { tx: out_tx, rx: in_rx })
+        })
+    }
+}
+
+#[tokio::test]
+async fn external_link_connector_handshake_login_ping() {
+    let b = Behavior::default();
+    let uri = start(b.clone()).await;
+    let c = Mt5Client::new(ClientConfig { link_connector: Some(Arc::new(ChannelConnector)), ..cfg(uri) });
+    c.connect().await.unwrap();
+    assert_eq!(c.server_build(), 6182);
+    c.login(12345678, "secret").await.unwrap();
+    c.ping().await.unwrap();
+    c.close().await;
+    assert_eq!(b.logins.load(Ordering::SeqCst), 1);
+}
