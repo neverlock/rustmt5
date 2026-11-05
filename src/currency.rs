@@ -215,32 +215,30 @@ impl Mt5Client {
         let account_ccy = account.get_str("currency").to_string();
         let positions: RecordList = self.get_positions().await?;
         let (mut margin, mut floating, mut unpriced) = (0.0f64, 0.0f64, 0usize);
-        // per symbol: (buy lots, buy margin, sell lots, sell margin, hedged cost per lot in account currency)
-        let mut sides: std::collections::HashMap<String, (f64, f64, f64, f64, f64)> = std::collections::HashMap::new();
-        let mut ordered: Vec<&Record> = positions.iter().collect();
-        ordered.sort_by_key(|p| (p.get_i64("time_create"), p.get_u64("position_id")));
-        let mut cumulative: std::collections::HashMap<(String, bool), f64> = std::collections::HashMap::new();
-        for p in ordered {
+        // per symbol: spec + (buy lots, buy margin value, sell lots, sell margin value, hedged cost per lot);
+        // "margin value" = leveraged margin in account currency BEFORE the margin-rate/tier factor
+        struct Agg { info: Record, buy: (f64, f64), sell: (f64, f64), hedged_cost: f64 }
+        let mut sides: std::collections::HashMap<String, Agg> = std::collections::HashMap::new();
+        for p in positions.iter() {
             let symbol = p.get_str("trade_symbol").to_string();
             let lots = p.get_f64("trade_volume") / 10f64.powi(self.volume_precision());
             let is_buy = p.get_i64("trade_action") == POSITION_TYPE_BUY;
             let Some(info) = self.symbol_info(&symbol).await? else { unpriced += 1; floating += p.get_f64("profit"); continue };
             match self.calc_margin_raw(&info, lots, p.get_f64("price_open"), leverage) {
                 Some(raw) => {
-                    let prior = cumulative.entry((symbol.clone(), is_buy)).or_insert(0.0);
-                    let raw = raw * margin_rate_factor(&info, account, *prior, lots, is_buy);
-                    *prior += lots;
                     let mut rate = p.get_f64("rate_margin");
                     if rate <= 0.0 {
                         let ccy = { let c = info.get_str("currency_margin"); if c.is_empty() { account_ccy.clone() } else { c.to_string() } };
                         rate = self.resolve_conversion_rates(&ccy, &account_ccy, &symbol, p.get_f64("price_open")).await?.map(|(buy, _)| buy).unwrap_or(0.0);
                     }
                     if rate > 0.0 {
-                        margin += raw * rate;
-                        let e = sides.entry(symbol.clone()).or_default();
-                        if is_buy { e.0 += lots; e.1 += raw * rate; } else { e.2 += lots; e.3 += raw * rate; }
                         // margin_hedged is in contract-size units for leveraged (calc mode 0) symbols; 0 = hedged volume is free
-                        e.4 = if info.get_i64("trade_calc_mode") == 0 && leverage > 0 { info.get_f64("margin_hedged") / leverage as f64 * rate } else { 0.0 };
+                        let hedged_cost = if info.get_i64("trade_calc_mode") == 0 && leverage > 0 { trade_part(&info).get_f64("margin_hedged") / leverage as f64 * rate } else { 0.0 };
+                        let e = sides.entry(symbol.clone()).or_insert_with(|| Agg { info: info.clone(), buy: (0.0, 0.0), sell: (0.0, 0.0), hedged_cost });
+                        e.hedged_cost = hedged_cost;
+                        let side = if is_buy { &mut e.buy } else { &mut e.sell };
+                        side.0 += lots;
+                        side.1 += raw * rate;
                     } else { unpriced += 1; }
                 }
                 None => unpriced += 1,
@@ -254,11 +252,11 @@ impl Mt5Client {
             floating += repriced.unwrap_or_else(|| p.get_f64("profit"));
         }
         let mut hedged_offset = 0.0;
-        for (bl, bm, sl, sm, cost) in sides.values() {
-            let adjusted = hedged_margin(*bl, *bm, *sl, *sm, *cost);
-            hedged_offset += bm + sm - adjusted;
+        for e in sides.values() {
+            let (m, unnetted) = net_symbol_margin(&e.info, account, e.buy, e.sell, e.hedged_cost);
+            margin += m;
+            hedged_offset += unnetted - m;
         }
-        margin -= hedged_offset;
         let equity = account.get_f64("balance") + account.get_f64("credit") + floating;
         Ok(Record::new()
             .with("hedged_offset", hedged_offset)
@@ -308,17 +306,25 @@ pub(crate) fn margin_rate_factor(info: &Record, account: &Record, prior_lots: f6
     rate * tier_factor.unwrap_or(1.0)
 }
 
-/// Margin of one symbol's positions after hedging: the overlapping volume `h = min(buy, sell)` is charged
-/// `h * hedged_cost_per_lot` instead of `h` lots at the average margin of each side.
-pub(crate) fn hedged_margin(buy_lots: f64, buy_margin: f64, sell_lots: f64, sell_margin: f64, hedged_cost_per_lot: f64) -> f64 {
-    if buy_lots <= 0.0 || sell_lots <= 0.0 { return buy_margin + sell_margin; }
-    let h = buy_lots.min(sell_lots);
-    buy_margin + sell_margin - h * buy_margin / buy_lots - h * sell_margin / sell_lots + h * hedged_cost_per_lot
+/// Margin of one symbol after netting buys against sells; returns `(margin, margin_without_netting)`.
+/// `buy`/`sell` = (lots, margin value before the rate/tier factor). Verified against the Web Terminal: the hedged
+/// volume `min(buy, sell)` costs `hedged_cost` per lot (0 when `margin_hedged` = 0), and the net volume is charged at the
+/// volume-weighted average margin per lot of the larger side, through the rate/tier factor of the cumulative volume
+/// (buy 0.01 + 2.00 and sell 1.00 BTCEURs = 4112.29; without the sell 12175.61).
+pub(crate) fn net_symbol_margin(info: &Record, account: &Record, buy: (f64, f64), sell: (f64, f64), hedged_cost: f64) -> (f64, f64) {
+    let side_margin = |(lots, value): (f64, f64), is_buy: bool| if lots > 0.0 { value * margin_rate_factor(info, account, 0.0, lots, is_buy) } else { 0.0 };
+    let unnetted = side_margin(buy, true) + side_margin(sell, false);
+    let hedged = buy.0.min(sell.0);
+    if hedged <= 0.0 { return (unnetted, unnetted); }
+    let (major, is_buy) = if buy.0 >= sell.0 { (buy, true) } else { (sell, false) };
+    let net = major.0 - hedged;
+    let net_margin = if net > 0.0 { net * (major.1 / major.0) * margin_rate_factor(info, account, 0.0, net, is_buy) } else { 0.0 };
+    (net_margin + hedged * hedged_cost, unnetted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{hedged_margin, margin_rate_factor, split_cent_currency};
+    use super::{margin_rate_factor, net_symbol_margin, split_cent_currency};
     use crate::protocol::{Record, Value};
 
     fn list(v: &[f64]) -> Value { Value::List(v.iter().map(|x| Value::Float(*x)).collect()) }
@@ -349,16 +355,26 @@ mod tests {
         assert_eq!(margin_rate_factor(&Record::new(), &Record::new(), 0.0, 1.0, true), 1.0);
     }
     #[test]
-    fn hedged_margin_offsets_overlap() {
-        // 0.3 buy (3.0) vs 0.1 sell (1.0): only the net 0.2 lot is charged when margin_hedged = 0
-        assert!((hedged_margin(0.3, 3.0, 0.1, 1.0, 0.0) - 2.0).abs() < 1e-12);
-        // fully hedged and free
-        assert!(hedged_margin(0.1, 1.0, 0.1, 1.0, 0.0).abs() < 1e-12);
-        // a hedged cost of 0.5/lot adds back 0.1 * 0.5
-        assert!((hedged_margin(0.1, 1.0, 0.1, 1.0, 0.5) - 0.05).abs() < 1e-12);
-        // one-sided positions are untouched
-        assert_eq!(hedged_margin(0.3, 3.0, 0.0, 0.0, 0.0), 3.0);
+    fn netting_matches_web_terminal() {
+        let mut trade = Record::new().with("symbol_path", "C3\\Cryptos\\BTCEURs");
+        trade.set("margin_rates_initial", list(&[0.1, 0.1, 0.0]));
+        let mut info = Record::new(); info.set("trade", trade);
+        let mut rule = Record::new().with("path", "C3\\Cryptos\\*").with("range_mode", 1u64);
+        rule.set("tiers", Value::List(vec![tier(0.0, 1.0, 0.5), tier(1.0, f64::MAX, 1.0)]));
+        let mut account = Record::new();
+        account.set("leverage_rules", Value::List(vec![Value::Record(rule)]));
+        let (p1, p2, p3) = (71700.84 * 1.12595, 71596.47 * 1.12621, 71351.89 * 1.12587);
+        let buy = (2.01, 0.01 * p1 + 2.0 * p2);
+        let (m, _) = net_symbol_margin(&info, &account, buy, (0.0, 0.0), 0.0);
+        assert!((m - 12175.61).abs() < 0.05, "{m}");
+        let (m, unnetted) = net_symbol_margin(&info, &account, buy, (1.0, p3), 0.0);
+        assert!((m - 4112.29).abs() < 0.05, "{m}");
+        assert!(unnetted > m);
+        // fully hedged and free; a hedged cost adds back per lot
+        assert_eq!(net_symbol_margin(&info, &account, (1.0, 100.0), (1.0, 100.0), 0.0).0, 0.0);
+        assert!((net_symbol_margin(&info, &account, (1.0, 100.0), (1.0, 100.0), 2.0).0 - 2.0).abs() < 1e-12);
     }
+
     #[test]
     fn cent_currencies() {
         assert_eq!(split_cent_currency("USC"), ("USD", 100.0));
