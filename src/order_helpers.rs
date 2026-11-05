@@ -158,7 +158,7 @@ impl Mt5Client {
         let price = normalize_price(o.price.unwrap_or_else(|| self.reference_price(symbol, is_buy)), ex.tick_size, ex.digits);
         let mut req = TradeRequest {
             symbol: symbol.to_string(),
-            volume: Self::volume_to_lots(volume, VOLUME_PRECISION).max(0) as u64,
+            volume: Self::volume_to_lots(volume, self.volume_precision()).max(0) as u64,
             digits: ex.digits,
             trade_type,
             type_flags: 2,
@@ -184,7 +184,7 @@ impl Mt5Client {
         self.trade_request(&TradeRequest {
             trade_action: TRADE_ACTION_PENDING,
             symbol: symbol.to_string(),
-            volume: Self::volume_to_lots(volume, VOLUME_PRECISION).max(0) as u64,
+            volume: Self::volume_to_lots(volume, self.volume_precision()).max(0) as u64,
             digits: ex.digits,
             trade_type,
             type_filling: o.filling.unwrap_or(2),
@@ -243,7 +243,7 @@ impl Mt5Client {
         let ex = self.exec_params(&symbol, None).await?;
         let is_long = pos.get_i64("trade_action") == POSITION_TYPE_BUY;
         let wire_volume = match volume {
-            Some(v) => { validate_volume(v)?; Self::volume_to_lots(v, VOLUME_PRECISION).max(0) as u64 }
+            Some(v) => { validate_volume(v)?; Self::volume_to_lots(v, self.volume_precision()).max(0) as u64 }
             None => pos.get_u64("trade_volume"),
         };
         let digits = { let d = pos.get_u64("digits") as u32; if d > 0 { d } else { ex.digits } };

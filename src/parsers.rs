@@ -236,8 +236,11 @@ pub fn to_copy_tick_record(tick: &Record) -> Record {
 
 /// Copy of a symbol-info record whose `volume_min/max/step/limit` are converted from the wire
 /// integer encoding (`lots * 10^VOLUME_PRECISION`) to lots, so they can be compared with user volumes.
-pub fn symbol_info_volumes_in_lots(info: &Record) -> Record {
-    let scale = 10f64.powi(VOLUME_PRECISION);
+pub fn symbol_info_volumes_in_lots(info: &Record) -> Record { symbol_info_volumes_in_lots_with(info, VOLUME_PRECISION) }
+
+/// Like [`symbol_info_volumes_in_lots`] for a server with a different wire volume precision.
+pub fn symbol_info_volumes_in_lots_with(info: &Record, precision: i32) -> Record {
+    let scale = 10f64.powi(precision);
     let mut out = info.clone();
     for key in ["volume_min", "volume_max", "volume_step", "volume_limit"] {
         if info.contains_key(key) { out.set(key, info.get_f64(key) / scale); }

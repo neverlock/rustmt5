@@ -218,7 +218,7 @@ impl Mt5Client {
         let mut sides: std::collections::HashMap<String, (f64, f64, f64, f64, f64)> = std::collections::HashMap::new();
         for p in &positions {
             let symbol = p.get_str("trade_symbol").to_string();
-            let lots = p.get_f64("trade_volume") / 10f64.powi(VOLUME_PRECISION);
+            let lots = p.get_f64("trade_volume") / 10f64.powi(self.volume_precision());
             let is_buy = p.get_i64("trade_action") == POSITION_TYPE_BUY;
             let Some(info) = self.symbol_info(&symbol).await? else { unpriced += 1; floating += p.get_f64("profit"); continue };
             match self.calc_margin_raw(&info, lots, p.get_f64("price_open"), leverage) {

@@ -53,6 +53,8 @@ pub struct ClientConfig {
     /// (defaults to the `SSL_CERT_FILE` environment variable when unset).
     /// HTTP `CONNECT` proxy for the WebSocket, `http://[user:pass@]host:port`. `None` = direct TCP (the default).
     pub proxy: Option<String>,
+    /// Decimal places of wire volumes (`lots * 10^n`). 8 on every server seen so far (0.01 lot = 1_000_000).
+    pub volume_precision: i32,
     pub ca_bundle: Option<std::path::PathBuf>,
     /// Undo the "scaled integer" tick price heuristic ported from pymt5 (see docs/market-data.md).
     /// Set to `false` for servers that already send real prices (e.g. CXMDirect build 6182).
@@ -77,6 +79,7 @@ impl Default for ClientConfig {
             symbol_cache_ttl: 0.0,
             ca_bundle: None,
             proxy: None,
+            volume_precision: crate::constants::VOLUME_PRECISION,
             normalize_ticks: true,
         }
     }
@@ -209,6 +212,7 @@ impl Mt5Client {
     pub fn with_uri(uri: impl Into<String>) -> Self { Self::new(ClientConfig::new(uri)) }
 
     pub fn config(&self) -> &ClientConfig { &self.inner.config }
+    pub(crate) fn volume_precision(&self) -> i32 { self.inner.config.volume_precision }
     pub fn transport(&self) -> &Transport { &self.inner.transport }
     pub(crate) fn st(&self) -> MutexGuard<'_, State> { self.inner.state.lock().unwrap_or_else(|e| e.into_inner()) }
 
