@@ -67,6 +67,18 @@ pub(crate) fn apply_trade_update(st: &mut State, update: &Record) {
     }
 }
 
+/// A request that completed with a deal (retcode 10009 "done") has a final order. The server does not always follow
+/// with the history-order push that removes it from the live set; without this a filled market order lingers as a
+/// pending order. Modify/cancel results also say 10009 but carry no deal, so they are left alone.
+pub(crate) fn apply_trade_result(st: &mut State, data: &Record) {
+    let Some(result) = data.get_record("result") else { return };
+    let order = result.get_u64("order");
+    if order != 0 && result.get_i64("retcode") == 10009 && result.get_u64("deal") != 0 {
+        st.live_orders.shift_remove(&order);
+        remember_finished_order(st, order);
+    }
+}
+
 fn remember_finished_order(st: &mut State, id: u64) {
     if st.finished_orders.len() >= 4096 { st.finished_orders.clear(); }
     st.finished_orders.insert(id);
@@ -272,7 +284,9 @@ impl Mt5Client {
             // forward to the trade_request() waiting for this action_id (if any); removal is done by the waiter
             let data = parse_trade_result_push(&r.body);
             let id = data.get_u64("action_id") as u32;
-            if let Some(tx) = state.lock().unwrap_or_else(|e| e.into_inner()).trade_waiters.get(&id) { let _ = tx.send(data); }
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            apply_trade_result(&mut st, &data);
+            if let Some(tx) = st.trade_waiters.get(&id) { let _ = tx.send(data); }
         });
         let state = self.inner.state.clone();
         self.transport().on(CMD_BOOK_PUSH, move |r| {
@@ -317,6 +331,29 @@ mod tests {
         if let Some(o) = o { r.set("order", o); }
         r.set("positions", p);
         r
+    }
+
+    fn result(order: i64, retcode: i64, deal: i64) -> Record {
+        Record::new().with("result", Record::new().with("order", order).with("retcode", retcode).with("deal", deal))
+    }
+
+    #[test]
+    fn filled_market_order_is_not_left_pending() {
+        let mut st = State::default();
+        apply_trade_update(&mut st, &upd(0, 0, Some(order(5, 1)), vec![]));
+        assert_eq!(st.live_orders.len(), 1);
+        // placed, no deal yet: still live
+        apply_trade_result(&mut st, &result(5, 10008, 0));
+        assert_eq!(st.live_orders.len(), 1);
+        // modify/cancel say 10009 without a deal: still live
+        apply_trade_result(&mut st, &result(5, 10009, 0));
+        assert_eq!(st.live_orders.len(), 1);
+        // done with a deal: final
+        apply_trade_result(&mut st, &result(5, 10009, 99));
+        assert!(st.live_orders.is_empty());
+        // a late "live" update must not resurrect it
+        apply_trade_update(&mut st, &upd(0, 1, Some(order(5, 1)), vec![]));
+        assert!(st.live_orders.is_empty());
     }
 
     #[test]
