@@ -109,12 +109,32 @@ impl Mt5Client {
         })
     }
 
+    /// Detailed contract specs for several symbol ids (cmd=18).
+    ///
+    /// The Web Terminal bundle sends `[u32 count][u32 symbol_id]*` and receives `[u32 count][record]*`.
+    pub async fn get_full_symbols(&self, symbol_ids: &[u32]) -> Result<RecordList> {
+        if symbol_ids.is_empty() { return Ok(vec![]); }
+        let r = self.transport().send_command(CMD_GET_FULL_SYMBOLS, &id_list_payload(symbol_ids)).await?;
+        if r.code != 0 || r.body.is_empty() { return Ok(vec![]); }
+        Ok(parse_counted_records(&r.body, FULL_SYMBOL_SCHEMA, FULL_SYMBOL_FIELD_NAMES).iter().map(normalize_full_symbol_record).collect())
+    }
+
     /// Detailed contract spec (cmd=18). `None` when the symbol is unknown/unparseable.
+    ///
+    /// Uses the symbol-id request format of the current Web Terminal (loading the symbol list first
+    /// if needed). pymt5 sends the symbol *name* instead, which servers such as build 6182 reject
+    /// with `code=1`; that legacy form is kept as a fallback for older servers.
     pub async fn get_full_symbol_info(&self, symbol: &str) -> Result<Option<Record>> {
         validate_symbol_name(symbol)?;
+        if let Some(id) = self.resolve_symbol_id(symbol).await? {
+            if let Some(info) = self.get_full_symbols(&[id]).await?.into_iter().next() {
+                self.st().full_symbols.insert(symbol.to_string(), info.clone());
+                return Ok(Some(info));
+            }
+        }
         let payload = SeriesCodec::serialize(&[SerField::fixed_string(&trunc(symbol, 32), 64)])?;
         let r = self.transport().send_command(CMD_GET_FULL_SYMBOLS, &payload).await?;
-        if r.body.is_empty() { return Ok(None); }
+        if r.code != 0 || r.body.is_empty() { return Ok(None); }
         let records = parse_counted_records(&r.body, FULL_SYMBOL_SCHEMA, FULL_SYMBOL_FIELD_NAMES);
         let parsed: Result<Option<Record>> = (|| {
             if let Some(first) = records.first() {

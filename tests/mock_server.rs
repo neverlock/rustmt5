@@ -159,6 +159,23 @@ async fn serve_connection(stream: tokio::net::TcpStream, b: Behavior) {
                 ws.send(Message::Binary(frame(&cipher, 8, 0, &tick_bytes(1, 115364.0, 115366.0)).into())).await.unwrap();
                 ws.send(Message::Binary(frame(&cipher, 8, 0, &tick_bytes(1, 0.0, 115370.0)).into())).await.unwrap();
             }
+            18 => {
+                // real Web Terminal format: [u32 count][u32 symbol_id]*  (name-based requests are rejected)
+                let n = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4]));
+                if payload.len() != 4 + 4 * n as usize || n == 0 {
+                    ws.send(Message::Binary(frame(&cipher, 18, 1, &[]).into())).await.unwrap();
+                } else {
+                    let id = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                    let mut body = 1u32.to_le_bytes().to_vec();
+                    body.extend(record_bytes(
+                        FULL_SYMBOL_SCHEMA,
+                        FULL_SYMBOL_FIELD_NAMES,
+                        &[("trade_symbol", Value::Str("EURUSD".into())), ("symbol_id", Value::UInt(id as u64)), ("digits", Value::UInt(5)),
+                          ("contract_size", Value::Float(100000.0)), ("currency_profit", Value::Str("USD".into()))],
+                    ));
+                    ws.send(Message::Binary(frame(&cipher, 18, 0, &body).into())).await.unwrap();
+                }
+            }
             4 => ws.send(Message::Binary(frame(&cipher, 4, 0, &[0, 0, 0, 0, 0, 0, 0, 0]).into())).await.unwrap(),
             12 => {
                 let body = SeriesCodec::serialize(&[
@@ -273,6 +290,11 @@ async fn account_symbols_ticks_and_trade() {
     let mut h = c.subscribe_ticks_managed(&[1]).await.unwrap();
     h.unsubscribe().await.unwrap();
     assert_eq!(b.subscribes.lock().unwrap().last().unwrap(), &vec![2]);
+
+    let full = c.get_full_symbol_info("EURUSD").await.unwrap().expect("full symbol info via id request");
+    assert_eq!((full.get_i64("digits"), full.get_f64("contract_size"), full.get_str("currency_profit")), (5, 100000.0, "USD"));
+    assert!(c.get_full_symbol_info("UNKNOWN").await.unwrap().is_none());
+    assert_eq!(c.symbol_info("EURUSD").await.unwrap().unwrap().get_str("currency_profit"), "USD");
 
     let pos = c.get_positions_and_orders().await.unwrap();
     assert!(pos.positions.is_empty() && pos.orders.is_empty());
