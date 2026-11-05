@@ -2,16 +2,15 @@
 
 > **Verification status.** Verified against real **demo** accounts (CXMDirect-Demo, build 6182): market open/close, partial close, close-by, pending
 > place/modify/cancel (incl. stop-limit and `SPECIFIED` expiration), SL/TP modify, `order_send`/`order_check`, live positions/orders, margin.
-> **Never run against a real-money account.** Not verified: instant/exchange execution modes (every symbol checked on the standard USD account reports
-> `trade_exemode = 0`), hedged-margin offsets, margin of CFD/stock/index symbols against the broker's own numbers.
+> **Never run against a real-money account.** Not verified: instant/exchange execution modes (every symbol checked on the standard USD account is market execution, mode 2), hedged-margin offsets, multi-tier margin volumes.
 
 ### Standard USD demo account (1:2000, hedging) - results
 
 | item | result |
 |---|---|
 | margin/profit conversions | EURUSD, USDJPY, XAUUSD (margin ccy XAU), EURGBP (profit ccy GBP) all convert to USD; conversion symbols are now auto-subscribed, and the shortest suffixed name wins (`XAUUSDs`, not `XAUUSD247s`) |
-| CFD/index/crypto margin | `calc_mode 2` gives `lots * contract * price` (no leverage), e.g. 0.1 lot US30 = 53593 USD. **Unverified against the broker** - compare with the terminal's margin before trusting it |
-| execution modes | `trade_exemode`, `trade_fill_flags`, `trade_instant_volume` are 0 for forex/metal/crypto/stock/index samples; `volume_min = step = 0.01 lot` |
+| CFD/index/crypto margin | **Verified vs the Web Terminal**: 0.01 lot BTCEURs = 40.37 USD (computed 40.366). Mode 2 margin = `lots * contract * price * margin_rates_initial[buy|sell] * tier`, where `tier` comes from the account's `leverage_rules` (path list matched against `trade.symbol_path`, `*` suffix = prefix; tiers are lot ranges, `margin_rate_initial` applies to the volume inside each range; `C3\Cryptos\*` is 0.5 for the first lot). Account leverage (1:2000) is NOT used for mode 2. Tier handling is per position (MT5 uses total symbol volume) and multi-tier volumes are unverified |
+| execution modes | Spec fields live in the nested `trade` record (`info.get_record("trade")`). BTC, US30, AAPL, XAUUSD all report `trade_exemode = 2` (market), `trade_fill_flags = 3`, `volume_min = step = 0.01 lot`. (An earlier note here claiming `exemode = 0` came from reading the top level of the record - wrong.) Instant/exchange modes still not seen on this server |
 | stop-limit | wire mapping is `price_order` = **stop (activation) price**, `price_trigger` = **limit price** (buy: limit < stop, else `10015`). Earlier code had the two swapped |
 | partial close | position record keeps the id, volume reduced, margin follows |
 | close-by | success, but the cmd 10 push has **no position records**; the local state is now updated from the request (`apply_close_by`) |

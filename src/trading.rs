@@ -1,5 +1,6 @@
 //! Trading: positions/orders, history, order calc/check/send (port of `pymt5._trading`).
 
+use crate::currency::margin_rate_factor;
 use tracing::{debug, info, warn};
 
 use crate::client::{trunc, Mt5Client};
@@ -255,6 +256,7 @@ impl Mt5Client {
         if account_currency.is_empty() { self.fail_last_error(-3, "account currency unavailable"); return Ok(None); }
         let leverage = account.get_i64("leverage");
         let Some(raw) = self.calc_margin_raw(&info, volume, price, leverage) else { return Ok(None) };
+        let raw = raw * margin_rate_factor(&info, &account, volume, is_buy);
         if raw == 0.0 { self.clear_last_error(); return Ok(Some(0.0)); }
         let margin_currency = { let m = info.get_str("currency_margin"); if m.is_empty() { account_currency.clone() } else { m.to_string() } };
         if currencies_equal(&margin_currency, &account_currency) { self.clear_last_error(); return Ok(Some(raw)); }

@@ -1,5 +1,6 @@
 //! Currency conversion, profit and margin formulas (port of `pymt5._currency`).
 
+use crate::protocol::Value;
 use tracing::debug;
 
 use crate::client::{is_soft_error, Mt5Client};
@@ -223,6 +224,7 @@ impl Mt5Client {
             let Some(info) = self.symbol_info(&symbol).await? else { unpriced += 1; floating += p.get_f64("profit"); continue };
             match self.calc_margin_raw(&info, lots, p.get_f64("price_open"), leverage) {
                 Some(raw) => {
+                    let raw = raw * margin_rate_factor(&info, account, lots, is_buy);
                     let mut rate = p.get_f64("rate_margin");
                     if rate <= 0.0 {
                         let ccy = { let c = info.get_str("currency_margin"); if c.is_empty() { account_ccy.clone() } else { c.to_string() } };
@@ -267,6 +269,38 @@ impl Mt5Client {
 }
 
 
+fn trade_part(info: &Record) -> &Record { info.get_record("trade").unwrap_or(info) }
+
+fn path_matches(patterns: &str, path: &str) -> bool {
+    patterns.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| match p.strip_suffix('*') { Some(prefix) => path.starts_with(prefix), None => p == path })
+}
+
+/// Multiplier on the leveraged margin that the server's margin rules imply (verified against the Web Terminal:
+/// 0.01 BTCEURs = 40.37 USD = notional * `margin_rates_initial` 0.10 * leverage-rule tier 0.5).
+///
+/// * the symbol's `margin_rates_initial[0|1]` (buy|sell); non-positive values count as 1;
+/// * the first account `leverage_rules` entry whose `path` list matches `trade.symbol_path` (`*` suffix = prefix match):
+///   tiers are volume ranges in lots (`range_mode` 1); each tier's `margin_rate_initial` applies to the part of the
+///   volume that falls inside it. Tiers are applied per position here, MT5 applies them to the symbol's total volume.
+pub(crate) fn margin_rate_factor(info: &Record, account: &Record, lots: f64, is_buy: bool) -> f64 {
+    let trade = trade_part(info);
+    let rate = trade.get_list("margin_rates_initial").get(if is_buy { 0 } else { 1 }).and_then(Value::as_f64).filter(|r| *r > 0.0).unwrap_or(1.0);
+    let path = trade.get_str("symbol_path");
+    let tier_factor = (|| {
+        if lots <= 0.0 || path.is_empty() { return None; }
+        let rule = account.get_records("leverage_rules").into_iter().find(|r| path_matches(r.get_str("path"), path))?;
+        if rule.get_i64("range_mode") != 1 { return None; }
+        let mut total = 0.0;
+        for t in rule.get_records("tiers") {
+            let (from, to) = (t.get_f64("range_from"), t.get_f64("range_to"));
+            let part = (lots.min(to) - from).max(0.0);
+            total += part * t.get_f64("margin_rate_initial");
+        }
+        (total > 0.0).then(|| total / lots)
+    })();
+    rate * tier_factor.unwrap_or(1.0)
+}
+
 /// Margin of one symbol's positions after hedging: the overlapping volume `h = min(buy, sell)` is charged
 /// `h * hedged_cost_per_lot` instead of `h` lots at the average margin of each side.
 pub(crate) fn hedged_margin(buy_lots: f64, buy_margin: f64, sell_lots: f64, sell_margin: f64, hedged_cost_per_lot: f64) -> f64 {
@@ -277,7 +311,32 @@ pub(crate) fn hedged_margin(buy_lots: f64, buy_margin: f64, sell_lots: f64, sell
 
 #[cfg(test)]
 mod tests {
-    use super::{hedged_margin, split_cent_currency};
+    use super::{hedged_margin, margin_rate_factor, split_cent_currency};
+    use crate::protocol::{Record, Value};
+
+    fn list(v: &[f64]) -> Value { Value::List(v.iter().map(|x| Value::Float(*x)).collect()) }
+    fn tier(from: f64, to: f64, rate: f64) -> Value { Value::Record(Record::new().with("range_from", from).with("range_to", to).with("margin_rate_initial", rate)) }
+
+    #[test]
+    fn margin_rules_match_web_terminal_btceur() {
+        let mut trade = Record::new().with("symbol_path", "C3\\Cryptos\\BTCEURs");
+        trade.set("margin_rates_initial", list(&[0.1, 0.1, 0.0]));
+        let mut info = Record::new(); info.set("trade", trade);
+        let rule = |path: &str, rate: f64| Value::Record({
+            let mut r = Record::new().with("path", path).with("range_mode", 1u64);
+            r.set("tiers", Value::List(vec![tier(0.0, 1.0, rate), tier(1.0, f64::MAX, 1.0)]));
+            r
+        });
+        let mut account = Record::new();
+        account.set("leverage_rules", Value::List(vec![rule("C3\\Cryptos\\BTCUSDs", 0.04), rule("C3\\CryptosP\\*,C3\\Cryptos\\*", 0.5)]));
+        // 0.01 lot at 71700.84 EUR * 1.12595 USD/EUR: the terminal showed 40.37
+        let raw = 0.01 * 71700.84 * 1.12595;
+        assert!((raw * margin_rate_factor(&info, &account, 0.01, true) - 40.37).abs() < 0.01);
+        // 2 lots: first lot at 0.5, second at 1.0 -> average 0.75, times the symbol rate 0.1
+        assert!((margin_rate_factor(&info, &account, 2.0, true) - 0.075).abs() < 1e-12);
+        // no matching rule / no data -> neutral
+        assert_eq!(margin_rate_factor(&Record::new(), &Record::new(), 1.0, true), 1.0);
+    }
     #[test]
     fn hedged_margin_offsets_overlap() {
         // 0.3 buy (3.0) vs 0.1 sell (1.0): only the net 0.2 lot is charged when margin_hedged = 0
