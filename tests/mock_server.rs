@@ -10,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use rustmt5::crypto::{initial_cipher, AesCipher};
 use rustmt5::protocol::{build_command, pack_outer, unpack_outer, Field, PropType, SerField, SeriesCodec, Value};
 use rustmt5::schemas::*;
-use rustmt5::{ClientConfig, Error, Mt5Client, Record};
+use rustmt5::{ClientConfig, CloseOptions, Error, ModifyOrderOptions, Mt5Client, PendingOrderOptions, Record, TradeRequest};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -51,6 +51,27 @@ struct Behavior {
     logins: Arc<AtomicUsize>,
     subscribes: Arc<Mutex<Vec<Vec<u32>>>>,
     connections: Arc<AtomicUsize>,
+    /// 0 = build-6182 style (4-byte ack + cmd 19 push), 1 = legacy immediate full response, 2 = ack only (no push)
+    trade_mode: u8,
+    /// every cmd=12 payload received
+    requests: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+/// cmd=19 push as observed on build 6182: u32 token + request(236) + 12 filler + result(128).
+fn trade_push(action_id: u32, retcode: u32, symbol: &str, volume: u64) -> Vec<u8> {
+    let mut b = 0x014f930du32.to_le_bytes().to_vec();
+    b.extend(SeriesCodec::serialize(&[
+        SerField::u32(action_id), SerField::u32(1), SerField::fixed_string(symbol, 64), SerField::u64(volume), SerField::u32(5), SerField::u64(0),
+        SerField::u32(0), SerField::u32(0), SerField::u32(0), SerField::u32(0), SerField::u32(0), SerField::f64(0.0), SerField::f64(0.0),
+        SerField::f64(0.0), SerField::f64(0.0), SerField::u32(0), SerField::f64(0.0), SerField::f64(0.0), SerField::fixed_string("", 64),
+        SerField::u64(0), SerField::u64(0), SerField::u32(0),
+    ]).unwrap());
+    b.extend(SeriesCodec::serialize(&[
+        SerField::u32(retcode), SerField::new(PropType::I64, 555i64, None), SerField::new(PropType::I64, 556i64, None),
+        SerField::new(PropType::I64, volume as i64, None), SerField::f64(1.15366), SerField::u32(9), SerField::f64(1.15364),
+        SerField::f64(1.15366), SerField::f64(0.0), SerField::fixed_string(if retcode == 10009 { "done" } else { "rejected" }, 64),
+    ]).unwrap());
+    b
 }
 
 fn account_body() -> Vec<u8> {
@@ -175,21 +196,69 @@ async fn serve_connection(stream: tokio::net::TcpStream, b: Behavior) {
                           ("trade", Value::Bytes(record_bytes(
                               ACCOUNT_WEB_TRADE_SETTINGS_SCHEMA,
                               ACCOUNT_WEB_TRADE_SETTINGS_FIELD_NAMES,
-                              &[("trade_mode", Value::Int(4)), ("volume_min", Value::UInt(1_000_000)), ("volume_step", Value::UInt(1_000_000)),
+                              &[("trade_mode", Value::Int(4)), ("trade_exemode", Value::UInt(2)), ("trade_fill_flags", Value::UInt(3)),
+                                ("volume_min", Value::UInt(1_000_000)), ("volume_step", Value::UInt(1_000_000)),
                                 ("volume_max", Value::UInt(100_000_000_000))],
                           )))],
                     ));
                     ws.send(Message::Binary(frame(&cipher, 18, 0, &body).into())).await.unwrap();
                 }
             }
-            4 => ws.send(Message::Binary(frame(&cipher, 4, 0, &[0, 0, 0, 0, 0, 0, 0, 0]).into())).await.unwrap(),
+            4 => {
+                let pos = record_bytes(POSITION_SCHEMA, POSITION_FIELD_NAMES, &[
+                    ("position_id", Value::Int(900)), ("trade_symbol", Value::Str("EURUSD".into())), ("trade_action", Value::UInt(0)),
+                    ("price_open", Value::Float(1.1)), ("price_close", Value::Float(1.2)), ("sl", Value::Float(1.0)), ("tp", Value::Float(1.3)),
+                    ("trade_volume", Value::UInt(1_000_000)), ("digits", Value::UInt(5)),
+                ]);
+                let ord = record_bytes(ORDER_SCHEMA, ORDER_FIELD_NAMES, &[
+                    ("trade_order", Value::Int(901)), ("trade_symbol", Value::Str("EURUSD".into())), ("order_type", Value::UInt(2)),
+                    ("volume_initial", Value::Int(2_000_000)), ("volume_current", Value::Int(2_000_000)), ("price_order", Value::Float(1.05)),
+                    ("type_filling", Value::UInt(2)), ("digits", Value::UInt(5)),
+                ]);
+                let mut body = 1u32.to_le_bytes().to_vec();
+                body.extend(pos);
+                body.extend(1u32.to_le_bytes());
+                body.extend(ord);
+                body.extend([0u8; 12]); // trailer seen on build 6182
+                ws.send(Message::Binary(frame(&cipher, 4, 0, &body).into())).await.unwrap();
+            }
             12 => {
-                let body = SeriesCodec::serialize(&[
-                    SerField::u32(10009), SerField::u64(555), SerField::u64(556), SerField::u64(1_000_000), SerField::f64(1.15366),
-                    SerField::f64(1.15364), SerField::f64(1.15366), SerField::fixed_string("done", 64), SerField::u32(9),
-                ])
-                .unwrap();
-                ws.send(Message::Binary(frame(&cipher, 12, 0, &body).into())).await.unwrap();
+                assert_eq!(payload.len(), 248, "trade request must use the 248-byte Web Terminal layout");
+                let action_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                assert_ne!(action_id, 0, "client must assign a unique action_id");
+                let type_filling = u32::from_le_bytes(payload[96..100].try_into().unwrap());
+                let volume = u64::from_le_bytes(payload[72..80].try_into().unwrap());
+                b.requests.lock().unwrap().push(payload.to_vec());
+                let action = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                let flags = u32::from_le_bytes(payload[104..108].try_into().unwrap());
+                let order = u64::from_le_bytes(payload[84..92].try_into().unwrap());
+                let position = u64::from_le_bytes(payload[228..236].try_into().unwrap());
+                // what a market-execution server accepts (behaviour observed on build 6182)
+                let valid = match action {
+                    3 => (flags == 2 && type_filling <= 1) || (flags == 3 && position != 0),
+                    5 => type_filling == 2 && flags == 2,
+                    6 => position != 0 && volume != 0,
+                    7 | 8 => order != 0 && volume != 0,
+                    10 => position != 0 && payload[236..244] != [0; 8],
+                    _ => false,
+                };
+                let retcode = if type_filling == 7 { 10030 } else if valid { 10009 } else { 10013 };
+                match b.trade_mode {
+                    1 => {
+                        let body = SeriesCodec::serialize(&[
+                            SerField::u32(10009), SerField::u64(555), SerField::u64(556), SerField::u64(1_000_000), SerField::f64(1.15366),
+                            SerField::f64(1.15364), SerField::f64(1.15366), SerField::fixed_string("done", 64), SerField::u32(9),
+                        ])
+                        .unwrap();
+                        ws.send(Message::Binary(frame(&cipher, 12, 0, &body).into())).await.unwrap();
+                    }
+                    mode => {
+                        ws.send(Message::Binary(frame(&cipher, 12, 0, &[0, 0, 0, 0]).into())).await.unwrap();
+                        if mode == 0 {
+                            ws.send(Message::Binary(frame(&cipher, 19, 0, &trade_push(action_id, retcode, "EURUSD", volume)).into())).await.unwrap();
+                        }
+                    }
+                }
             }
             _ => ws.send(Message::Binary(frame(&cipher, cmd, 0, &[]).into())).await.unwrap(),
         }
@@ -262,7 +331,7 @@ async fn account_symbols_ticks_and_trade() {
     assert_eq!(c.version().await.unwrap(), Some((500, 6182, String::new())));
     assert_eq!(c.terminal_info().await.unwrap().get_str("company"), "MockCo");
     let summary = c.get_account_summary().await.unwrap();
-    assert_eq!((summary.leverage, summary.positions_count), (100, 0));
+    assert_eq!((summary.leverage, summary.positions_count, summary.orders_count), (100, 1, 1));
 
     let symbols = c.load_symbols(true).await.unwrap();
     assert_eq!(symbols.len(), 2);
@@ -302,11 +371,16 @@ async fn account_symbols_ticks_and_trade() {
     assert!(c.get_full_symbol_info("UNKNOWN").await.unwrap().is_none());
     assert_eq!(c.symbol_info("EURUSD").await.unwrap().unwrap().get_str("currency_profit"), "USD");
 
+    // used margin is computed locally from the live positions (0.01 lot of a 100000 contract at 1:100 = 10)
+    let am = c.account_margin().await.unwrap();
+    assert!((am.get_f64("margin") - 10.0).abs() < 1e-9, "{am:?}");
+    assert_eq!((am.get_i64("positions"), am.get_i64("unpriced"), am.get_str("margin_source")), (1, 0, "computed"));
+    assert!((am.get_f64("margin_free") - (am.get_f64("equity") - 10.0)).abs() < 1e-9);
     // order_check: server volume limits are wire-encoded (0.01 lot = 1_000_000); user volumes are lots
     let req = |vol: f64| Record::new().with("action", 1i64).with("symbol", "EURUSD").with("volume", vol).with("type", 0i64).with("price", 1.1f64);
     let ok = c.order_check(&req(0.01)).await.unwrap();
     assert_eq!(ok.get_i64("retcode"), 0, "{ok:?}");
-    assert!((ok.get_f64("margin") - 10.0).abs() < 1e-9, "100000*0.01/100 leverage = 10: {ok:?}");
+    assert!((ok.get_f64("margin") - 20.0).abs() < 1e-9, "open position (10) + this order (10): {ok:?}");
     assert!(ok.get_bool("margin_known"));
     assert_eq!(c.order_check(&req(0.37)).await.unwrap().get_i64("retcode"), 0);
     let low = c.order_check(&req(0.001)).await.unwrap();
@@ -316,12 +390,26 @@ async fn account_symbols_ticks_and_trade() {
     assert_eq!(c.order_check(&req(50.0)).await.unwrap().get_i64("retcode"), 10019, "not enough money");
 
     let pos = c.get_positions_and_orders().await.unwrap();
-    assert!(pos.positions.is_empty() && pos.orders.is_empty());
+    assert_eq!((pos.positions.len(), pos.orders.len()), (1, 1), "the 12-byte trailer must not disturb parsing");
+    assert_eq!(pos.positions[0].get_i64("position_id"), 900);
+    assert_eq!(pos.orders[0].get_i64("trade_order"), 901);
 
     let r = c.buy_market("EURUSD", 0.01, &Default::default()).await.unwrap();
     assert!(r.success);
-    assert_eq!((r.retcode, r.deal, r.order, r.volume, r.request_id), (10009, 555, 556, 1_000_000, 9));
+    assert_eq!((r.retcode, r.deal, r.order, r.volume), (10009, 555, 556, 1_000_000));
+    assert_ne!(r.request_id, 0);
     assert_eq!(r.comment, "done");
+    // the broker rejects the order asynchronously: success must be false (previously reported as success)
+    let rejected = c.trade_request(&TradeRequest { trade_action: 1, symbol: "EURUSD".into(), volume: 1_000_000, type_filling: 7, ..Default::default() }).await.unwrap();
+    assert_eq!((rejected.retcode, rejected.success, rejected.comment.as_str()), (10030, false, "rejected"));
+    assert_eq!(rejected.description, "Invalid order filling type");
+    // typed push event delivers the same result
+    let seen_ev: Arc<Mutex<Vec<i64>>> = Arc::default();
+    let s3 = seen_ev.clone();
+    c.on_trade_result_event(move |e| s3.lock().unwrap().push(e.retcode));
+    c.buy_market("EURUSD", 0.01, &Default::default()).await.unwrap();
+    for _ in 0..50 { if !seen_ev.lock().unwrap().is_empty() { break; } tokio::time::sleep(Duration::from_millis(20)).await; }
+    assert_eq!(seen_ev.lock().unwrap().first(), Some(&10009));
     assert!(c.buy_market("EURUSD", 0.0, &Default::default()).await.is_err());
     assert!(c.buy_limit("EURUSD", 0.1, 0.0, &Default::default()).await.is_err());
     c.close().await;
@@ -402,4 +490,99 @@ fn login_payload_matches_browser_capture_sizes() {
     assert_eq!(enc.len(), 928);
     assert_eq!(pack_outer(&enc).len(), 936);
     drop(c);
+}
+
+#[tokio::test]
+async fn trade_result_legacy_immediate_and_timeout() {
+    // legacy servers answer cmd=12 with the complete result
+    let c = Mt5Client::new(cfg(start(Behavior { trade_mode: 1, ..Default::default() }).await));
+    c.connect().await.unwrap();
+    c.login(1, "pw").await.unwrap();
+    c.load_symbols(true).await.unwrap();
+    let r = c.buy_market("EURUSD", 0.01, &Default::default()).await.unwrap();
+    assert_eq!((r.success, r.retcode, r.order), (true, 10009, 556));
+    c.close().await;
+    // ack but never a result push -> Timeout error (order may be live; caller must check)
+    let c = Mt5Client::new(ClientConfig { timeout: 0.4, ..cfg(start(Behavior { trade_mode: 2, ..Default::default() }).await) });
+    c.connect().await.unwrap();
+    c.login(1, "pw").await.unwrap();
+    c.load_symbols(true).await.unwrap();
+    match c.buy_market("EURUSD", 0.01, &Default::default()).await {
+        Err(Error::Timeout(m)) => assert!(m.contains("no final trade result push"), "{m}"),
+        other => panic!("expected timeout, got {other:?}"),
+    }
+    c.ping().await.unwrap();
+    c.close().await;
+}
+
+fn field_u32(req: &[u8], off: usize) -> u32 { u32::from_le_bytes(req[off..off + 4].try_into().unwrap()) }
+fn field_u64(req: &[u8], off: usize) -> u64 { u64::from_le_bytes(req[off..off + 8].try_into().unwrap()) }
+fn field_f64(req: &[u8], off: usize) -> f64 { f64::from_le_bytes(req[off..off + 8].try_into().unwrap()) }
+
+#[tokio::test]
+async fn order_helpers_build_web_terminal_requests() {
+    let b = Behavior::default();
+    let c = Mt5Client::new(cfg(start(b.clone()).await));
+    c.connect().await.unwrap();
+    c.login(1, "pw").await.unwrap();
+    c.load_symbols(true).await.unwrap();
+
+    // market buy in market-execution mode: action 3, type_flags 2, IOC (fill flags 3), price 0
+    let r = c.buy_market("EURUSD", 0.01, &Default::default()).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u32(&req, 96), field_u32(&req, 104), field_u64(&req, 72), field_u32(&req, 92)), (3, 1, 2, 1_000_000, 0));
+    assert_eq!(field_f64(&req, 112), 0.0);
+
+    // pending order: RETURN filling by default, type_flags 2
+    let r = c.buy_limit("EURUSD", 0.02, 1.0123456, &PendingOrderOptions::default()).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u32(&req, 96), field_u32(&req, 104), field_u32(&req, 92)), (5, 2, 2, 2));
+    assert_eq!(field_f64(&req, 112), 1.01235, "price normalised to 5 digits");
+
+    // close: looks the position up (sell side of a buy), type_flags 3, ticket + current price
+    let r = c.close_position(900, None, &CloseOptions::default()).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u32(&req, 92), field_u32(&req, 104), field_u64(&req, 228), field_u64(&req, 72)), (3, 1, 3, 900, 1_000_000));
+    assert_eq!(field_f64(&req, 112), 1.2, "current price of the position");
+    assert!(matches!(c.close_position(12345, None, &Default::default()).await, Err(Error::Validation(_))));
+
+    // cancel: resends symbol, volume, type and price of the existing order
+    let r = c.cancel_pending_order(901).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u64(&req, 84), field_u64(&req, 72), field_u32(&req, 92)), (8, 901, 2_000_000, 2));
+    assert_eq!(field_f64(&req, 112), 1.05);
+
+    // modify: only the price changes, the rest comes from the existing order
+    let r = c.modify_pending_order(901, &ModifyOrderOptions { price: Some(1.04), ..Default::default() }).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u64(&req, 72), field_f64(&req, 112)), (7, 2_000_000, 1.04));
+
+    // SLTP: keeps the other level
+    let r = c.modify_position_sltp(900, Some(1.05), None).await.unwrap();
+    assert!(r.success, "{r:?}");
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u64(&req, 228), field_f64(&req, 128), field_f64(&req, 136)), (6, 900, 1.05, 1.3));
+
+    // MetaTrader5-style dicts are translated to the server's representation
+    let deal = Record::new().with("action", 1i64).with("symbol", "EURUSD").with("volume", 0.01f64).with("type", 0i64);
+    assert!(c.order_send(&deal).await.unwrap().success);
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u32(&req, 104)), (3, 2), "DEAL on a market-execution symbol -> action 3");
+    assert!(c.order_send(&Record::new().with("action", 1i64).with("symbol", "EURUSD").with("position", 900i64).with("type", 1i64)).await.unwrap().success);
+    let req = b.requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!((field_u32(&req, 4), field_u32(&req, 104), field_u64(&req, 228)), (3, 3, 900), "DEAL with a position closes it");
+    assert!(c.order_send(&Record::new().with("action", 8i64).with("order", 901i64)).await.unwrap().success);
+    assert_eq!(field_u32(b.requests.lock().unwrap().last().unwrap(), 4), 8);
+    assert!(c.order_send(&Record::new().with("action", 6i64).with("position", 900i64).with("tp", 1.4f64)).await.unwrap().success);
+    assert!(matches!(c.order_send(&Record::new().with("action", 99i64)).await, Err(Error::Validation(_))));
+
+    // the old pymt5 style (DEAL action on a market-execution symbol) is rejected by this server model
+    let bad = c.trade_request(&TradeRequest { trade_action: 1, symbol: "EURUSD".into(), volume: 1_000_000, type_flags: 2, ..Default::default() }).await.unwrap();
+    assert_eq!((bad.retcode, bad.success), (10013, false));
+    c.close().await;
 }

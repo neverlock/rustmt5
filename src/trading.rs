@@ -51,7 +51,10 @@ pub struct TradeRequest {
     pub price_trigger: f64,
     pub price_sl: f64,
     pub price_tp: f64,
+    /// Serialised as u32 (the Web Terminal layout).
     pub deviation: u64,
+    pub price_top: f64,
+    pub price_bottom: f64,
     pub comment: String,
     pub position_id: u64,
     pub position_by: u64,
@@ -78,14 +81,29 @@ impl Mt5Client {
     /// `lots * 10^precision` as the integer volume the Web Terminal expects (default precision 8).
     pub fn volume_to_lots(volume: f64, precision: i32) -> i64 { (volume * 10f64.powi(precision)).round_ties_even() as i64 }
 
-    pub(crate) fn resolve_digits(&self, symbol: &str, digits: Option<u32>) -> u32 {
-        digits.unwrap_or_else(|| self.st().symbols.get(symbol).map(|s| s.digits).unwrap_or(5))
-    }
 
+    /// Open positions and pending orders.
+    ///
+    /// The first call after login seeds the live state from cmd 4; afterwards the state is kept current by
+    /// cmd 10 pushes (some servers keep answering cmd 4 with the login-time snapshot, see docs/trading.md).
+    /// Floating `profit`/`price_close` of positions are those of the last snapshot/push, not recomputed.
     pub async fn get_positions_and_orders(&self) -> Result<PositionsAndOrders> {
         let r = self.transport().send_command(CMD_GET_POSITIONS_ORDERS, &[]).await?;
         let (positions, orders) = split_positions_orders(&r.body);
-        Ok(PositionsAndOrders { positions, orders })
+        let mut st = self.st();
+        if !st.trade_state_ready {
+            st.live_positions = positions.iter().map(|p| (p.get_u64("position_id"), p.clone())).collect();
+            st.live_orders = orders.iter().map(|o| (o.get_u64("trade_order"), o.clone())).collect();
+            st.trade_state_ready = true;
+        }
+        Ok(PositionsAndOrders { positions: st.live_positions.values().cloned().collect(), orders: st.live_orders.values().cloned().collect() })
+    }
+
+    /// Discard the live state and reload it from the server's cmd 4 answer. Only useful on servers that answer
+    /// cmd 4 with current data; on build 6182 the answer is the (stale) login-time snapshot.
+    pub async fn reload_positions_and_orders(&self) -> Result<PositionsAndOrders> {
+        self.st().trade_state_ready = false;
+        self.get_positions_and_orders().await
     }
 
     /// Closed deals and orders between two unix-second timestamps (`0` = unbounded).
@@ -246,8 +264,64 @@ impl Mt5Client {
         }
         if r.price_sl < 0.0 { return Err(Error::validation(format!("price_sl must be >= 0, got {}", r.price_sl))); }
         if r.price_tp < 0.0 { return Err(Error::validation(format!("price_tp must be >= 0, got {}", r.price_tp))); }
+        let mut req = r.clone();
+        if req.action_id == 0 { req.action_id = self.next_action_id(); }
+        let r = &req;
+        let payload = Self::build_trade_request_payload(r)?;
+        // Register for the asynchronous result *before* sending so an early push cannot be missed.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        self.st().trade_waiters.insert(r.action_id, tx);
+        let res = match self.transport().send_command(CMD_TRADE_REQUEST, &payload).await {
+            Ok(res) => res,
+            Err(e) => { self.st().trade_waiters.remove(&r.action_id); return Err(e); }
+        };
+        let full_len = get_series_size(TRADE_RESPONSE_SCHEMA)?;
+        // Servers that answer cmd=12 with the full result (pymt5 layout) or with a non-zero status are done now.
+        let ack = res.body.get(0..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        if res.code != 0 || res.body.len() >= full_len || ack != Some(0) {
+            self.st().trade_waiters.remove(&r.action_id);
+            if res.code != 0 {
+                warn!("trade_request {} rejected by server: code={}", r.symbol, res.code);
+                return Ok(TradeResult { retcode: -2, description: format!("command rejected by server: code={}", res.code), success: false, request_id: r.action_id as u64, ..Default::default() });
+            }
+            return self.parse_trade_response(&res.body, &r.symbol, r.trade_action, r.volume);
+        }
+        // Build 6182 behaviour: cmd=12 returns a 4-byte ack (0 = accepted); the outcome arrives as one or more
+        // cmd=19 pushes (e.g. 10002 accepted, then 10008 placed / 10009 done / a rejection code). Wait for the final one.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(self.config().timeout);
+        let mut last: Option<Record> = None;
+        let outcome = loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(push)) => {
+                    let retcode = push.get_record("result").map(|x| x.get_u64("retcode") as u32).unwrap_or(0);
+                    debug!("trade result push action_id={} retcode={retcode}", r.action_id);
+                    let intermediate = is_intermediate_retcode(retcode);
+                    last = Some(push);
+                    if !intermediate { break Ok(()); }
+                }
+                Ok(None) => break Err(Error::session("trade result channel closed")),
+                Err(_) => break Err(Error::Timeout(format!(
+                    "no final trade result push for action_id={} within {}s (last status: {}); the request was accepted - check positions/orders before retrying",
+                    r.action_id,
+                    self.config().timeout,
+                    last.as_ref().and_then(|p| p.get_record("result")).map(|x| retcode_text(x.get_u64("retcode") as u32)).unwrap_or_else(|| "none".into())
+                ))),
+            }
+        };
+        self.st().trade_waiters.remove(&r.action_id);
+        outcome?;
+        let tr = Self::trade_result_from_push(&last.unwrap_or_default(), r.action_id);
+        info!("trade_request {} action={} vol={} -> {tr}", r.symbol, r.trade_action, r.volume);
+        Ok(tr)
+    }
+
+    /// Serialise a trade request (cmd=12) - 248 bytes, exactly as the Web Terminal JS (`getTradeRequest`) does.
+    ///
+    /// pymt5's `TRADE_REQUEST_SCHEMA` (236 bytes: deviation u64, no top/bottom) is *wrong* for this layout and
+    /// shifts every field after `price_tp`; the server then silently ignores e.g. `position_id`.
+    pub(crate) fn build_trade_request_payload(r: &TradeRequest) -> Result<Vec<u8>> {
         let u32f = |v: i64| SerField::new(PropType::U32, v, None);
-        let payload = SeriesCodec::serialize(&[
+        SeriesCodec::serialize(&[
             SerField::u32(r.action_id),
             u32f(r.trade_action),
             SerField::fixed_string(&trunc(&r.symbol, 32), 64),
@@ -263,54 +337,105 @@ impl Mt5Client {
             SerField::f64(r.price_trigger),
             SerField::f64(r.price_sl),
             SerField::f64(r.price_tp),
-            SerField::u64(r.deviation),
+            SerField::new(PropType::U32, r.deviation as i64, None),
+            SerField::f64(r.price_top),
+            SerField::f64(r.price_bottom),
             SerField::fixed_string(&trunc(&r.comment, 32), 64),
             SerField::u64(r.position_id),
             SerField::u64(r.position_by),
             u32f(r.time_expiration),
-        ])?;
-        let res = self.transport().send_command(CMD_TRADE_REQUEST, &payload).await?;
-        self.parse_trade_response(&res.body, &r.symbol, r.trade_action, r.volume)
+        ])
     }
 
-    /// Official-style `order_send()` over a request dict (`action`, `symbol`, `volume` in lots, `type`,
-    /// `price`, `stoplimit`, `sl`, `tp`, `deviation`, `comment`, `position`, `expiration`, ...).
+    /// Next non-zero request id used to match the cmd=19 result push with its cmd=12 request.
+    pub(crate) fn next_action_id(&self) -> u32 {
+        let mut st = self.st();
+        let id = st.next_action_id.max(1);
+        st.next_action_id = id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn trade_result_from_push(push: &Record, action_id: u32) -> TradeResult {
+        let res = push.get_record("result").cloned().unwrap_or_default();
+        let retcode = res.get_u64("retcode") as u32;
+        TradeResult {
+            retcode: retcode as i64,
+            description: retcode_text(retcode),
+            success: matches!(retcode, 0 | TRADE_RETCODE_DONE | TRADE_RETCODE_DONE_PARTIAL | TRADE_RETCODE_PLACED),
+            deal: res.get_u64("deal"),
+            order: res.get_u64("order"),
+            volume: res.get_u64("volume"),
+            price: res.get_f64("price"),
+            bid: res.get_f64("bid"),
+            ask: res.get_f64("ask"),
+            comment: res.get_str("comment").trim_matches('\0').to_string(),
+            request_id: action_id as u64,
+        }
+    }
+
+    /// Official-style `order_send()` over a MetaTrader5 request dict.
+    ///
+    /// Keys: `action` (`TRADE_ACTION_DEAL`=1, `PENDING`=5, `SLTP`=6, `MODIFY`=7, `REMOVE`=8, `CLOSE_BY`=10),
+    /// `symbol`, `volume` (lots), `type` (order type), `price`, `stoplimit`, `sl`, `tp`, `deviation`, `comment`,
+    /// `position`, `position_by`, `order`, `type_filling`, `type_time`, `expiration`, `magic`.
+    ///
+    /// The request is translated to what the Web Terminal sends (see docs/trading.md): e.g. a DEAL becomes the
+    /// execution-mode specific action/filling of the symbol, and SLTP/MODIFY/REMOVE/close-by look up the existing
+    /// position or order first. Use [`Mt5Client::trade_request`] to send raw fields.
     pub async fn order_send(&self, request: &Record) -> Result<TradeResult> {
+        use crate::order_helpers::{CloseOptions, MarketOrderOptions, ModifyOrderOptions, PendingOrderOptions};
         let symbol = request.get_str("symbol").to_string();
         let order_type = request.get_i64("type");
+        let volume = request.get_f64("volume");
         let price = request.get_f64("price");
-        let stoplimit = request.get_f64("stoplimit");
-        let (price_order, price_trigger) =
-            if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (stoplimit, price) } else { (price, 0.0) };
-        let raw_volume = request.get_f64("volume");
-        let volume = Self::volume_to_lots(raw_volume, 8);
-        if volume < 0 { return Err(Error::validation(format!("volume encoding overflow: {raw_volume} -> {volume}"))); }
-        let digits = if symbol.is_empty() { 0 } else { self.resolve_digits(&symbol, None) };
-        let action_id = { let a = request.get_u64("action_id"); if a != 0 { a } else { request.get_u64("request_id") } } as u32;
-        let filling = if request.contains_key("type_filling") { request.get_i64("type_filling") } else { ORDER_FILLING_FOK };
-        self.trade_request(&TradeRequest {
-            action_id,
-            trade_action: request.get_i64("action"),
-            symbol,
-            volume: volume as u64,
-            digits,
-            order: request.get_u64("order"),
-            trade_type: order_type,
-            type_filling: filling,
-            type_time: if request.contains_key("type_time") { request.get_i64("type_time") } else { ORDER_TIME_GTC },
-            type_flags: request.get_i64("type_flags"),
-            type_reason: request.get_i64("type_reason"),
-            price_order,
-            price_trigger,
-            price_sl: request.get_f64("sl"),
-            price_tp: request.get_f64("tp"),
-            deviation: request.get_u64("deviation"),
-            comment: request.get_str("comment").to_string(),
-            position_id: request.get_u64("position"),
-            position_by: request.get_u64("position_by"),
-            time_expiration: coerce_value_timestamp(request.get("expiration")),
-        })
-        .await
+        let filling = request.contains_key("type_filling").then(|| request.get_i64("type_filling"));
+        let opt = |k: &str| request.contains_key(k).then(|| request.get_f64(k));
+        match request.get_i64("action") {
+            TRADE_ACTION_DEAL => {
+                let position = request.get_u64("position");
+                if position != 0 {
+                    let vol = (volume > 0.0).then_some(volume);
+                    self.close_position(position, vol, &CloseOptions {
+                        deviation: request.get_u64("deviation"), comment: request.get_str("comment").to_string(), filling, magic: request.get_i64("magic"),
+                    }).await
+                } else {
+                    let o = MarketOrderOptions {
+                        sl: request.get_f64("sl"), tp: request.get_f64("tp"), price: (price > 0.0).then_some(price), deviation: request.get_u64("deviation"),
+                        comment: request.get_str("comment").to_string(), filling, digits: None, magic: request.get_i64("magic"),
+                    };
+                    match order_type {
+                        ORDER_TYPE_BUY => self.buy_market(&symbol, volume, &o).await,
+                        ORDER_TYPE_SELL => self.sell_market(&symbol, volume, &o).await,
+                        t => Err(Error::validation(format!("DEAL needs order type BUY(0) or SELL(1), got {t}"))),
+                    }
+                }
+            }
+            TRADE_ACTION_PENDING => {
+                let (order_price, trigger) = if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (request.get_f64("stoplimit"), price) } else { (price, 0.0) };
+                if order_side(order_type).is_none() || order_type <= ORDER_TYPE_SELL { return Err(Error::validation(format!("PENDING needs a pending order type (2..7), got {order_type}"))); }
+                let o = PendingOrderOptions {
+                    sl: request.get_f64("sl"), tp: request.get_f64("tp"), comment: request.get_str("comment").to_string(), filling,
+                    time_type: if request.contains_key("type_time") { request.get_i64("type_time") } else { ORDER_TIME_GTC },
+                    expiration: coerce_value_timestamp(request.get("expiration")), digits: None, magic: request.get_i64("magic"),
+                };
+                self.open_pending_typed(&symbol, volume, order_type, order_price, trigger, &o).await
+            }
+            TRADE_ACTION_SLTP => self.modify_position_sltp(request.get_u64("position"), opt("sl"), opt("tp")).await,
+            TRADE_ACTION_MODIFY => {
+                let stop_limit = order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT;
+                self.modify_pending_order(request.get_u64("order"), &ModifyOrderOptions {
+                    price: if stop_limit { opt("stoplimit") } else { opt("price") },
+                    trigger: if stop_limit { opt("price") } else { None },
+                    sl: opt("sl"), tp: opt("tp"),
+                    time_type: request.contains_key("type_time").then(|| request.get_i64("type_time")),
+                    expiration: request.contains_key("expiration").then(|| coerce_value_timestamp(request.get("expiration"))),
+                    comment: request.contains_key("comment").then(|| request.get_str("comment").to_string()),
+                }).await
+            }
+            TRADE_ACTION_REMOVE => self.cancel_pending_order(request.get_u64("order")).await,
+            TRADE_ACTION_CLOSE_BY => self.close_position_by(request.get_u64("position"), request.get_u64("position_by")).await,
+            a => Err(Error::validation(format!("unsupported trade action: {a}"))),
+        }
     }
 
     /// Local pre-flight validation (not a server RPC). Returns `retcode`, balances, margin and `comment`.
@@ -343,10 +468,12 @@ impl Mt5Client {
         let normalized = Self::normalize_order_request(request);
         let (mut retcode, mut comment) = self.validate_order_check_request(&normalized).await?;
         let account = self.get_account().await?;
+        // the account record has no margin figures: compute them from the live positions
+        let am = self.account_margin_from(&account).await?;
         let balance = account.get_f64("balance");
-        let equity = if account.contains_key("equity") { account.get_f64("equity") } else { balance };
-        let profit = account.get_f64("profit");
-        let margin = account.get_f64("margin");
+        let equity = am.get_f64("equity");
+        let profit = am.get_f64("profit");
+        let margin = am.get_f64("margin");
         let ok_codes = [0i64, TRADE_RETCODE_PLACED as i64, TRADE_RETCODE_DONE as i64, TRADE_RETCODE_DONE_PARTIAL as i64];
         let estimate = if ok_codes.contains(&retcode) { self.estimate_order_margin(&normalized).await? } else { Some(0.0) };
         let margin_known = estimate.is_some();

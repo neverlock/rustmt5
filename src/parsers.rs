@@ -310,6 +310,7 @@ pub fn parse_tick_batch(
     body: &[u8],
     symbols_by_id: &HashMap<u32, SymbolInfo>,
     tick_cache_by_id: Option<&HashMap<u32, Record>>,
+    normalize_prices: bool,
 ) -> RecordList {
     let tick_size = get_series_size(TICK_SCHEMA).expect("static schema");
     let count = body.len() / tick_size;
@@ -321,9 +322,11 @@ pub fn parse_tick_batch(
         let sid = tick.get_u64("symbol_id") as u32;
         if let Some(sym) = symbols_by_id.get(&sid) {
             tick.set("symbol", sym.name.as_str());
-            for k in ["bid", "ask", "last"] {
-                let v = normalize_tick_price_value(tick.get_f64(k), sym.digits, &sym.name);
-                tick.set(k, v);
+            if normalize_prices {
+                for k in ["bid", "ask", "last"] {
+                    let v = normalize_tick_price_value(tick.get_f64(k), sym.digits, &sym.name);
+                    tick.set(k, v);
+                }
             }
         }
         if let Some(cached) = tick_cache_by_id.and_then(|c| c.get(&sid)) {
@@ -507,6 +510,125 @@ pub fn parse_account_response(body: &[u8]) -> Record {
     r
 }
 
+/// Field names of [`TRADE_REQUEST_V2_SCHEMA`] (the request echoed back inside cmd=19 pushes).
+pub const TRADE_REQUEST_FIELD_NAMES: &[&str] = &[
+    "action_id", "trade_action", "trade_symbol", "trade_volume", "digits", "trade_order", "trade_type", "type_filling", "type_time",
+    "type_flags", "type_reason", "price_order", "price_trigger", "price_sl", "price_tp", "deviation", "price_top", "price_bottom",
+    "comment", "position_id", "position_by", "time_expiration",
+];
+
+use crate::protocol::{Field, PropType};
+const fn f(ty: PropType, len: Option<usize>) -> Field { Field { ty, len } }
+
+/// The 248-byte request layout of the Web Terminal (cmd=12 payload and the echo in cmd=19 pushes).
+pub const TRADE_REQUEST_V2_SCHEMA: &[Field] = &[
+    f(PropType::U32, None), f(PropType::U32, None), f(PropType::FixedString, Some(64)), f(PropType::U64, None), f(PropType::U32, None),
+    f(PropType::U64, None), f(PropType::U32, None), f(PropType::U32, None), f(PropType::U32, None), f(PropType::U32, None),
+    f(PropType::U32, None), f(PropType::F64, None), f(PropType::F64, None), f(PropType::F64, None), f(PropType::F64, None),
+    f(PropType::U32, None), f(PropType::F64, None), f(PropType::F64, None), f(PropType::FixedString, Some(64)), f(PropType::U64, None),
+    f(PropType::U64, None), f(PropType::U32, None),
+];
+
+/// Result part of a cmd=19 push as seen on Web Terminal build 6182 (matches the JS `Ep` schema, 128 bytes).
+pub const TRADE_RESULT_V2_SCHEMA: &[Field] = &[
+    f(PropType::U32, None), f(PropType::I64, None), f(PropType::I64, None), f(PropType::I64, None), f(PropType::F64, None),
+    f(PropType::U32, None), f(PropType::F64, None), f(PropType::F64, None), f(PropType::F64, None), f(PropType::FixedString, Some(64)),
+];
+pub const TRADE_RESULT_V2_FIELD_NAMES: &[&str] = &["retcode", "deal", "order", "volume", "price", "res_time", "bid", "ask", "last", "comment"];
+
+/// `u32 token` + request (248 B) + result (128 B).
+const TRADE_PUSH_V2_RESULT_OFFSET: usize = 4 + 248;
+
+/// Parse a cmd=19 body into `{...request fields, "result": {...}}`.
+///
+/// Two layouts exist: the one observed on build 6182 (380 bytes, parsed here) and the older
+/// `TRADE_RESULT_PUSH`(244) + `TRADE_RESULT_RESPONSE`(108) layout documented by pymt5 (352 bytes).
+/// The result record always carries `retcode`, `order`, `deal`, `volume`, `price`, `bid`, `ask`, `comment`.
+pub fn parse_trade_result_push(body: &[u8]) -> Record {
+    let v2_len = TRADE_PUSH_V2_RESULT_OFFSET + 128;
+    if body.len() >= v2_len {
+        let mut data = Record::new();
+        if let Ok(req) = SeriesCodec::parse_record(body, TRADE_REQUEST_V2_SCHEMA, TRADE_REQUEST_FIELD_NAMES, 4) { data.extend(req.0); }
+        if let Ok(mut res) = SeriesCodec::parse_record(body, TRADE_RESULT_V2_SCHEMA, TRADE_RESULT_V2_FIELD_NAMES, TRADE_PUSH_V2_RESULT_OFFSET) {
+            res.set("trade_order", res.get("order").cloned().unwrap_or_default());
+            data.set("result", res);
+        }
+        return data;
+    }
+    let action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA).unwrap();
+    let resp_size = get_series_size(TRADE_RESULT_RESPONSE_SCHEMA).unwrap();
+    let mut data = Record::new();
+    if body.len() >= action_size {
+        if let Ok(r) = SeriesCodec::parse_record(body, TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES, 0) { data.extend(r.0); }
+    }
+    if body.len() >= action_size + resp_size {
+        if let Ok(mut r) = SeriesCodec::parse_record(body, TRADE_RESULT_RESPONSE_SCHEMA, TRADE_RESULT_RESPONSE_FIELD_NAMES, action_size) {
+            r.set("order", r.get("trade_order").cloned().unwrap_or_default());
+            data.set("result", r);
+        }
+    }
+    data
+}
+
+/// Parse a cmd=10 trade-update push.
+///
+/// Layouts (`update_type` is the first u32):
+///
+/// * build 6182, `update_type == 2` (760 B): `type, transaction_id, reserved` + **DEAL** (356) + **POSITION** (344)
+///   + balance block (6 f64). A closed position is reported with `trade_volume == 0`.
+/// * build 6182, `update_type` 0 (open orders) / 1 (history orders) (>= 368 B): `type, transaction_id,
+///   transaction_type` + **ORDER** (356) (a trailing second block is ignored).
+/// * pymt5 layouts (older servers): `type 2` = balance(48) + counted deals + counted positions;
+///   others = `TRADE_TRANSACTION`(12 B: flag_mask, transaction_id, transaction_type) + ORDER.
+///
+/// Result keys: `update_type`, and either `transaction_id`, `transaction_type`, `order`
+/// or `balance_info`, `deals`, `positions`.
+pub fn parse_trade_transaction(body: &[u8]) -> Option<Record> {
+    let update_type = read_u32(body, 0)?;
+    let mut data = Record::new().with("update_type", update_type).with("flag_mask", update_type);
+    let deal_size = get_series_size(DEAL_SCHEMA).unwrap();
+    let pos_size = get_series_size(POSITION_SCHEMA).unwrap();
+    let order_size = get_series_size(ORDER_SCHEMA).unwrap();
+    let bal_size = get_series_size(TRADE_UPDATE_BALANCE_SCHEMA).unwrap();
+    if update_type == 2 {
+        let v2_len = 12 + deal_size + pos_size + bal_size;
+        if body.len() == v2_len {
+            data.set("transaction_id", read_u32(body, 4).unwrap_or(0));
+            if let Ok(d) = SeriesCodec::parse_record(body, DEAL_SCHEMA, DEAL_FIELD_NAMES, 12) { data.set("deals", vec![d]); }
+            if let Ok(p) = SeriesCodec::parse_record(body, POSITION_SCHEMA, POSITION_FIELD_NAMES, 12 + deal_size) { data.set("positions", vec![p]); }
+            if let Ok(b) = SeriesCodec::parse_record(body, TRADE_UPDATE_BALANCE_SCHEMA, TRADE_UPDATE_BALANCE_FIELD_NAMES, 12 + deal_size + pos_size) {
+                data.set("balance_info", b);
+            }
+            return Some(data);
+        }
+        let mut offset = 4usize;
+        if body.len() >= offset + bal_size {
+            if let Ok(r) = SeriesCodec::parse_record(body, TRADE_UPDATE_BALANCE_SCHEMA, TRADE_UPDATE_BALANCE_FIELD_NAMES, offset) { data.set("balance_info", r); }
+            offset += bal_size;
+        }
+        data.set("deals", parse_counted_records(body.get(offset..).unwrap_or(&[]), DEAL_SCHEMA, DEAL_FIELD_NAMES));
+        if let Some(n) = read_u32(body, offset) { offset = offset.saturating_add(4).saturating_add((n as usize).saturating_mul(deal_size)); }
+        data.set("positions", parse_counted_records(body.get(offset..).unwrap_or(&[]), POSITION_SCHEMA, POSITION_FIELD_NAMES));
+    } else {
+        let legacy_txn = get_series_size(TRADE_TRANSACTION_SCHEMA).unwrap();
+        // v2 header = type + id + transaction_type (12 B); pymt5 = type + 3 u32 (16 B, total exactly 372 B with one order).
+        let v2 = body.len() >= 12 + order_size && body.len() != 4 + legacy_txn + order_size;
+        let (txn_off, order_off) = if v2 { (4, 12) } else { (4, 4 + legacy_txn) };
+        if v2 {
+            data.set("transaction_id", read_u32(body, 4).unwrap_or(0));
+            data.set("transaction_type", read_u32(body, 8).unwrap_or(0));
+        } else if body.len() >= txn_off + legacy_txn {
+            if let Ok(r) = SeriesCodec::parse_record(body, TRADE_TRANSACTION_SCHEMA, TRADE_TRANSACTION_FIELD_NAMES, txn_off) {
+                for (k, v) in r.0 { if k != "flag_mask" { data.set(&k, v); } }
+            }
+        }
+        if body.len() >= order_off + order_size {
+            if let Ok(r) = SeriesCodec::parse_record(body, ORDER_SCHEMA, ORDER_FIELD_NAMES, order_off) { data.set("order", r); }
+        }
+    }
+    Some(data)
+}
+
 pub fn parse_verification_status(body: &[u8]) -> VerificationStatus {
     if body.len() < 2 { return VerificationStatus::default(); }
     VerificationStatus { email: body[0] != 0, phone: body[1] != 0 }
@@ -620,6 +742,16 @@ mod tests {
         assert_eq!(normalize_tick_price_value(2000.5, 2, "XAU"), 2000.5);
     }
 
+    #[test]
+    fn tick_normalisation_can_be_disabled() {
+        let mut syms = HashMap::new();
+        syms.insert(5, SymbolInfo { name: "AAPL".into(), symbol_id: 5, digits: 2, ..Default::default() });
+        let body = tick_bytes(5, 200.0, 200.5);
+        assert_eq!(parse_tick_batch(&body, &syms, None, true)[0].get_f64("bid"), 2.0, "pymt5 heuristic");
+        let t = &parse_tick_batch(&body, &syms, None, false)[0];
+        assert_eq!((t.get_f64("bid"), t.get_f64("ask"), t.get_str("symbol")), (200.0, 200.5, "AAPL"));
+    }
+
     fn tick_bytes(sid: u32, bid: f64, ask: f64) -> Vec<u8> {
         SeriesCodec::serialize(&[
             SerField::u32(sid), SerField::i32(1_700_000_000), SerField::u32(3), SerField::f64(bid), SerField::f64(ask),
@@ -636,14 +768,14 @@ mod tests {
         body.extend(tick_bytes(5, 0.0, 1.3));
         let mut cache = HashMap::new();
         cache.insert(5u32, Record::new().with("bid", 1.05f64).with("last", 9.0f64));
-        let ticks = parse_tick_batch(&body, &syms, Some(&cache));
+        let ticks = parse_tick_batch(&body, &syms, Some(&cache), true);
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].get_str("symbol"), "EURUSD");
         assert_eq!(ticks[0].get_i64("tick_time_ms"), 1_700_000_000_250);
         assert_eq!(ticks[1].get_f64("bid"), 1.05); // carried forward
         assert_eq!(ticks[1].get_f64("last"), 9.0);
         assert_eq!(ticks[1].get_f64("ask"), 1.3);
-        assert!(parse_tick_batch(&[], &syms, None).is_empty());
+        assert!(parse_tick_batch(&[], &syms, None, true).is_empty());
     }
 
     #[test]
@@ -742,6 +874,84 @@ mod tests {
         assert!(validate_requested_volume(&info, 1000.01).unwrap().contains("above"));
         assert!(validate_requested_volume(&info, 0.015).unwrap().contains("step"));
         assert!(!symbol_info_volumes_in_lots(&Record::new()).contains_key("volume_min"));
+    }
+
+    fn push_v2(action_id: u32, retcode: u32) -> Vec<u8> {
+        let mut b = 0x014f930du32.to_le_bytes().to_vec();
+        b.extend(SeriesCodec::serialize(&[
+            SerField::u32(action_id), SerField::u32(5), SerField::fixed_string("EURUSDc", 64), SerField::u64(1_000_000), SerField::u32(5),
+            SerField::u64(0), SerField::u32(2), SerField::u32(0), SerField::u32(0), SerField::u32(0), SerField::u32(17),
+            SerField::f64(1.07), SerField::f64(0.0), SerField::f64(0.0), SerField::f64(0.0), SerField::u32(0), SerField::f64(0.0), SerField::f64(0.0),
+            SerField::fixed_string("probe", 64), SerField::u64(77), SerField::u64(0), SerField::u32(0),
+        ]).unwrap());
+        b.extend(SeriesCodec::serialize(&[
+            SerField::u32(retcode), SerField::new(PropType::I64, 111i64, None), SerField::new(PropType::I64, 222i64, None),
+            SerField::new(PropType::I64, 1_000_000i64, None), SerField::f64(1.0701), SerField::u32(7), SerField::f64(1.0700),
+            SerField::f64(1.0702), SerField::f64(0.0), SerField::fixed_string("filled", 64),
+        ]).unwrap());
+        b
+    }
+
+    fn rec_bytes(schema: &[Field], names: &[&str], over: &[(&str, Value)]) -> Vec<u8> {
+        let fields: Vec<SerField> = schema.iter().zip(names).map(|(f, n)| {
+            let v = over.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone()).unwrap_or(match f.ty {
+                PropType::F32 | PropType::F64 => Value::Float(0.0),
+                PropType::String | PropType::FixedString => Value::Str(String::new()),
+                PropType::Bytes => Value::Bytes(vec![]),
+                _ => Value::Int(0),
+            });
+            SerField::new(f.ty, v, f.len)
+        }).collect();
+        SeriesCodec::serialize(&fields).unwrap()
+    }
+
+    #[test]
+    fn trade_transaction_v2_layouts() {
+        // type 2: type, id, reserved + DEAL + POSITION + balance (760 B on build 6182)
+        let mut b = Vec::new();
+        for w in [2u32, 7_611_347, 0] { b.extend(w.to_le_bytes()); }
+        b.extend(rec_bytes(DEAL_SCHEMA, DEAL_FIELD_NAMES, &[("deal", Value::Int(11)), ("entry", Value::UInt(1)), ("position_id", Value::Int(42))]));
+        b.extend(rec_bytes(POSITION_SCHEMA, POSITION_FIELD_NAMES, &[("position_id", Value::Int(42)), ("trade_volume", Value::UInt(0)), ("trade_symbol", Value::Str("EURUSDc".into()))]));
+        for v in [99999.04f64, 0.0, 0.0, 0.0, -0.96, 0.0] { b.extend(v.to_le_bytes()); }
+        assert_eq!(b.len(), 760);
+        let d = parse_trade_transaction(&b).unwrap();
+        assert_eq!((d.get_i64("update_type"), d.get_i64("transaction_id")), (2, 7_611_347));
+        assert_eq!(d.get_records("deals")[0].get_i64("deal"), 11);
+        assert_eq!((d.get_records("positions")[0].get_i64("position_id"), d.get_records("positions")[0].get_u64("trade_volume")), (42, 0));
+        assert_eq!(d.get_record("balance_info").unwrap().get_f64("balance"), 99999.04);
+
+        // type 0: type, id, transaction_type + ORDER (368 B); the 736 B variant carries a second block that is ignored
+        let order = rec_bytes(ORDER_SCHEMA, ORDER_FIELD_NAMES, &[("trade_order", Value::Int(901)), ("order_state", Value::UInt(1)), ("trade_symbol", Value::Str("EURUSDc".into()))]);
+        let mut o = Vec::new();
+        for w in [0u32, 14_523_219, 2] { o.extend(w.to_le_bytes()); }
+        o.extend(&order);
+        assert_eq!(o.len(), 368);
+        let d = parse_trade_transaction(&o).unwrap();
+        assert_eq!((d.get_i64("transaction_id"), d.get_i64("transaction_type"), d.get_record("order").unwrap().get_i64("trade_order")), (14_523_219, 2, 901));
+        o.extend(vec![0u8; 368]);
+        assert_eq!(parse_trade_transaction(&o).unwrap().get_record("order").unwrap().get_i64("trade_order"), 901);
+
+        // pymt5 layout: type + TRADE_TRANSACTION(12) + ORDER = 372 B
+        let mut legacy = Vec::new();
+        for w in [0u32, 0, 5, 1] { legacy.extend(w.to_le_bytes()); }
+        legacy.extend(&order);
+        assert_eq!(legacy.len(), 372);
+        let d = parse_trade_transaction(&legacy).unwrap();
+        assert_eq!((d.get_i64("transaction_id"), d.get_i64("transaction_type"), d.get_record("order").unwrap().get_i64("trade_order")), (5, 1, 901));
+        assert!(parse_trade_transaction(&[1, 2]).is_none());
+    }
+
+    #[test]
+    fn trade_result_push_v2_layout() {
+        let body = push_v2(42, 10009);
+        assert_eq!(body.len(), 380);
+        let d = parse_trade_result_push(&body);
+        assert_eq!((d.get_u64("action_id"), d.get_str("trade_symbol"), d.get_str("comment"), d.get_u64("position_id")), (42, "EURUSDc", "probe", 77));
+        let r = d.get_record("result").unwrap();
+        assert_eq!((r.get_i64("retcode"), r.get_i64("order"), r.get_i64("deal"), r.get_i64("volume")), (10009, 222, 111, 1_000_000));
+        assert_eq!((r.get_f64("price"), r.get_str("comment")), (1.0701, "filled"));
+        assert_eq!(parse_trade_result_push(&push_v2(1, 10030)).get_record("result").unwrap().get_i64("retcode"), 10030);
+        assert!(parse_trade_result_push(&[]).is_empty());
     }
 
     #[test]

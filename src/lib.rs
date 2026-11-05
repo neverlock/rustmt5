@@ -43,7 +43,7 @@ pub mod validation;
 pub use client::{observed_build_release_date, ClientConfig, LoginParams, Mt5Client, MT5_TERMINAL_VERSION};
 pub use error::{Error, Result};
 pub use metrics::MetricsCollector;
-pub use order_helpers::{CloseOptions, MarketOrderOptions, PendingOrderOptions};
+pub use order_helpers::{normalize_price, CloseOptions, MarketOrderOptions, ModifyOrderOptions, PendingOrderOptions};
 pub use order_manager::{OrderManager, OrderState, PositionSummary, TrackedOrder};
 pub use parsers::TimeArg;
 pub use pool::{Mt5ConnectionPool, PoolAccount};

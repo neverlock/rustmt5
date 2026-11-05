@@ -5,13 +5,31 @@ use tracing::debug;
 use crate::client::{is_soft_error, Mt5Client};
 use crate::constants::*;
 use crate::error::Result;
+use crate::protocol::RecordList;
 use crate::parsers::currencies_equal;
 use crate::protocol::Record;
+
+/// `("USD", 100.0)` for the cent currency `USC` (1 USC = 1/100 USD), `(ccy, 1.0)` for everything else.
+fn split_cent_currency(ccy: &str) -> (&str, f64) {
+    match ccy {
+        "USC" => ("USD", 100.0),
+        "EUC" => ("EUR", 100.0),
+        "GBC" => ("GBP", 100.0),
+        "AUC" => ("AUD", 100.0),
+        _ => (ccy, 1.0),
+    }
+}
 
 impl Mt5Client {
     /// Buy/sell conversion rates `source -> target`; tries direct, then triangulates via USD.
     pub(crate) async fn resolve_conversion_rates(&self, source: &str, target: &str, current_symbol: &str, fallback: f64) -> Result<Option<(f64, f64)>> {
         if source.is_empty() || target.is_empty() { return Ok(None); }
+        // Cent accounts (USC, EUC, ...) have no FX pairs: convert via the main currency and scale.
+        let ((s_base, s_factor), (t_base, t_factor)) = (split_cent_currency(source), split_cent_currency(target));
+        if (s_base, t_base) != (source, target) {
+            let scale = t_factor / s_factor;
+            return Ok(Box::pin(self.resolve_conversion_rates(s_base, t_base, current_symbol, fallback)).await?.map(|(b, s)| (b * scale, s * scale)));
+        }
         if currencies_equal(source, target) { return Ok(Some((1.0, 1.0))); }
         let buy = self.resolve_side_rate(source, target, true, current_symbol, fallback).await?;
         let sell = self.resolve_side_rate(source, target, false, current_symbol, fallback).await?;
@@ -160,5 +178,74 @@ impl Mt5Client {
             return Some(units * price);
         }
         fail(self, -18, &format!("trade_calc_mode={mode} is not supported yet"))
+    }
+
+    /// Account margin figures computed locally from the live positions.
+    ///
+    /// The cmd=3 account record has no margin fields and the pushes do not carry used margin either - the Web Terminal
+    /// computes it client-side - so this does the same: for every open position
+    /// `margin = calc_margin_raw(symbol, lots, price_open, leverage) * rate_margin`, where `rate_margin` is the
+    /// margin-currency -> account-currency rate the server supplies on each position (falls back to tick-based
+    /// conversion), and floating profit is re-priced from the cached tick when available.
+    ///
+    /// Returns `margin`, `margin_free`, `margin_level`, `equity`, `profit` (floating), `positions`, `unpriced`
+    /// (positions that could not be priced - their margin is missing) and `margin_source = "computed"`.
+    /// Hedged-margin offsets are not modelled (every position counts in full).
+    pub async fn account_margin(&self) -> Result<Record> {
+        let account = self.get_account().await?;
+        self.account_margin_from(&account).await
+    }
+
+    pub(crate) async fn account_margin_from(&self, account: &Record) -> Result<Record> {
+        let leverage = account.get_i64("leverage");
+        let account_ccy = account.get_str("currency").to_string();
+        let positions: RecordList = self.get_positions().await?;
+        let (mut margin, mut floating, mut unpriced) = (0.0f64, 0.0f64, 0usize);
+        for p in &positions {
+            let symbol = p.get_str("trade_symbol").to_string();
+            let lots = p.get_f64("trade_volume") / 10f64.powi(VOLUME_PRECISION);
+            let is_buy = p.get_i64("trade_action") == POSITION_TYPE_BUY;
+            let Some(info) = self.symbol_info(&symbol).await? else { unpriced += 1; floating += p.get_f64("profit"); continue };
+            match self.calc_margin_raw(&info, lots, p.get_f64("price_open"), leverage) {
+                Some(raw) => {
+                    let mut rate = p.get_f64("rate_margin");
+                    if rate <= 0.0 {
+                        let ccy = { let c = info.get_str("currency_margin"); if c.is_empty() { account_ccy.clone() } else { c.to_string() } };
+                        rate = self.resolve_conversion_rates(&ccy, &account_ccy, &symbol, p.get_f64("price_open")).await?.map(|(buy, _)| buy).unwrap_or(0.0);
+                    }
+                    if rate > 0.0 { margin += raw * rate; } else { unpriced += 1; }
+                }
+                None => unpriced += 1,
+            }
+            // floating profit: re-price with the cached tick if possible, otherwise use the last reported value
+            let rate_profit = p.get_f64("rate_profit");
+            let repriced = self.symbol_info_tick(&symbol).and_then(|t| {
+                let now = if is_buy { t.get_f64("bid") } else { t.get_f64("ask") };
+                if now > 0.0 && rate_profit > 0.0 { self.calc_profit_raw(&info, is_buy, lots, p.get_f64("price_open"), now).map(|raw| raw * rate_profit) } else { None }
+            });
+            floating += repriced.unwrap_or_else(|| p.get_f64("profit"));
+        }
+        let equity = account.get_f64("balance") + account.get_f64("credit") + floating;
+        Ok(Record::new()
+            .with("margin", margin)
+            .with("equity", equity)
+            .with("profit", floating)
+            .with("margin_free", equity - margin)
+            .with("margin_level", if margin > 0.0 { equity / margin * 100.0 } else { 0.0 })
+            .with("positions", positions.len())
+            .with("unpriced", unpriced)
+            .with("margin_source", "computed"))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::split_cent_currency;
+    #[test]
+    fn cent_currencies() {
+        assert_eq!(split_cent_currency("USC"), ("USD", 100.0));
+        assert_eq!(split_cent_currency("EUR"), ("EUR", 1.0));
+        assert_eq!(split_cent_currency("EUC"), ("EUR", 100.0));
     }
 }

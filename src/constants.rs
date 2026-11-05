@@ -38,6 +38,9 @@ pub const BOND_CALC_MODES: &[i64] = &[37, 39];
 pub fn retcode_description(code: u32) -> Option<&'static str> {
     Some(match code {
         0 => "OK",
+        10001 => "Request on the way",
+        10002 => "Request accepted",
+        10003 => "Request is being processed",
         10004 => "Requote",
         10006 => "Request rejected",
         10007 => "Request cancelled by trader",
@@ -82,3 +85,12 @@ pub fn retcode_text(code: u32) -> String {
 /// Decimal digits of the integer volume encoding used by the Web Terminal: `1.0 lot == 10^8`.
 /// Volumes in trade requests *and* the `volume_min/max/step/limit` fields of symbol info use it.
 pub const VOLUME_PRECISION: i32 = 8;
+
+/// Intermediate statuses of an asynchronous trade request (the final status follows in a later push).
+pub fn is_intermediate_retcode(code: u32) -> bool { matches!(code, 10001..=10003) }
+
+/// `trade_action` values the Web Terminal uses for market deals depending on the symbol's execution mode
+/// (`trade_exemode`): 1 request -> [`TRADE_ACTION_DEAL`], 2 instant, 3 market, 4 exchange.
+pub const TRADE_ACTION_INSTANT: i64 = 2;
+pub const TRADE_ACTION_MARKET: i64 = 3;
+pub const TRADE_ACTION_EXCHANGE: i64 = 4;

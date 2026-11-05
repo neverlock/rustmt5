@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
+use indexmap::IndexMap;
 use rand::Rng;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -51,6 +52,9 @@ pub struct ClientConfig {
     /// Extra PEM root CA bundle to trust in addition to the built-in roots
     /// (defaults to the `SSL_CERT_FILE` environment variable when unset).
     pub ca_bundle: Option<std::path::PathBuf>,
+    /// Undo the "scaled integer" tick price heuristic ported from pymt5 (see docs/market-data.md).
+    /// Set to `false` for servers that already send real prices (e.g. CXMDirect build 6182).
+    pub normalize_ticks: bool,
 }
 
 impl Default for ClientConfig {
@@ -70,6 +74,7 @@ impl Default for ClientConfig {
             metrics: None,
             symbol_cache_ttl: 0.0,
             ca_bundle: None,
+            normalize_ticks: true,
         }
     }
 }
@@ -134,6 +139,15 @@ pub(crate) struct State {
     pub reconnect_count: u32,
     pub connected_at: Option<Instant>,
     pub health_threshold_ms: f64,
+    /// Receivers of the cmd=19 result pushes (several per request: accepted -> ... -> final) keyed by action_id.
+    pub trade_waiters: HashMap<u32, tokio::sync::mpsc::UnboundedSender<Record>>,
+    pub next_action_id: u32,
+    pub normalize_ticks: bool,
+    /// Live positions/orders: login-time snapshot (cmd 4) + cmd 10 pushes. Some servers (build 6182) keep
+    /// answering cmd 4 with the login-time snapshot, so pushes are the only source of changes.
+    pub live_positions: IndexMap<u64, Record>,
+    pub live_orders: IndexMap<u64, Record>,
+    pub trade_state_ready: bool,
 }
 
 pub(crate) struct Inner {
@@ -163,7 +177,7 @@ pub(crate) fn trunc(s: &str, n: usize) -> String { s.chars().take(n).collect() }
 impl Mt5Client {
     pub fn new(config: ClientConfig) -> Self {
         let transport = Transport::with_options(config.uri.clone(), config.timeout, config.rate_limit, config.rate_burst, config.metrics.clone(), config.ca_bundle.clone());
-        let state = Arc::new(Mutex::new(State { health_threshold_ms: 5000.0, ..Default::default() }));
+        let state = Arc::new(Mutex::new(State { health_threshold_ms: 5000.0, normalize_ticks: config.normalize_ticks, next_action_id: 1, ..Default::default() }));
         let client = Self {
             inner: Arc::new(Inner {
                 config,
@@ -406,7 +420,13 @@ impl Mt5Client {
     }
 
     pub async fn login_with(&self, p: LoginParams) -> Result<(String, u64)> {
-        self.st().bootstrap_pristine = false;
+        {
+            let mut st = self.st();
+            st.bootstrap_pristine = false;
+            st.live_positions.clear();
+            st.live_orders.clear();
+            st.trade_state_ready = false;
+        }
         let payload = self.build_login_payload(&p)?;
         let result = self.inner.transport.send_command(CMD_LOGIN, &payload).await?;
         if result.code != 0 {
@@ -423,6 +443,8 @@ impl Mt5Client {
         }
         info!("logged in: login={} session={}", p.login, session_id);
         if p.auto_heartbeat { self.start_heartbeat(); }
+        // Baseline for the live position/order state (the server's snapshot is taken at login time).
+        if let Err(e) = self.get_positions_and_orders().await { warn!("could not load the initial positions/orders: {e}"); }
         Ok((bytes_to_hex(&token), session_id))
     }
 

@@ -3,7 +3,7 @@
 //!
 //!   LOGIN=... PASSWORD=... SERVER=wss://... SYMBOL=EURUSD cargo run --example trading
 
-use rustmt5::{ClientConfig, Mt5Client, PendingOrderOptions};
+use rustmt5::{ClientConfig, ModifyOrderOptions, Mt5Client, PendingOrderOptions};
 
 #[tokio::main]
 async fn main() -> rustmt5::Result<()> {
@@ -22,7 +22,7 @@ async fn main() -> rustmt5::Result<()> {
     let placed = client.buy_limit(&symbol, 0.01, far, &PendingOrderOptions { comment: "rustmt5 demo".into(), ..Default::default() }).await?;
     println!("place: {placed}");
     if placed.success && placed.order != 0 {
-        let modified = client.modify_pending_order(&symbol, placed.order, far * 0.999, 0.0, 0.0, 0, 0).await?;
+        let modified = client.modify_pending_order(placed.order, &ModifyOrderOptions { price: Some(far * 0.999), ..Default::default() }).await?;
         println!("modify: {modified}");
         println!("cancel: {}", client.cancel_pending_order(placed.order).await?);
     }

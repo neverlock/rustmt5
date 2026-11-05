@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::client::{Mt5Client, State};
 use crate::constants::*;
 use crate::protocol::{get_series_size, Record, RecordList, SeriesCodec, Value};
-use crate::parsers::{parse_account_response, parse_book_entries, parse_counted_records, parse_tick_batch};
+use crate::parsers::{parse_account_response, parse_book_entries, parse_counted_records, parse_tick_batch, parse_trade_result_push, parse_trade_transaction};
 use crate::schemas::*;
 use crate::transport::{CallbackError, CommandResult, ListenerId};
 use crate::types::{AccountEvent, BookEvent, TickEvent, TradeResultEvent};
@@ -32,59 +32,33 @@ pub(crate) fn split_positions_orders(body: &[u8]) -> (RecordList, RecordList) {
     (positions, orders)
 }
 
-/// Parse a cmd=19 body into `{...action fields, "result": {...}}`.
-pub(crate) fn parse_trade_result_push(body: &[u8]) -> Record {
-    let action_size = get_series_size(TRADE_RESULT_PUSH_SCHEMA).unwrap();
-    let resp_size = get_series_size(TRADE_RESULT_RESPONSE_SCHEMA).unwrap();
-    let mut data = Record::new();
-    if body.len() >= action_size {
-        if let Ok(r) = SeriesCodec::parse_record(body, TRADE_RESULT_PUSH_SCHEMA, TRADE_RESULT_PUSH_FIELD_NAMES, 0) {
-            data.extend(r.0);
-        }
-    }
-    if body.len() >= action_size + resp_size {
-        if let Ok(r) = SeriesCodec::parse_record(body, TRADE_RESULT_RESPONSE_SCHEMA, TRADE_RESULT_RESPONSE_FIELD_NAMES, action_size) {
-            data.set("result", r);
-        }
-    }
-    data
-}
-
-fn parse_trade_transaction(body: &[u8]) -> Option<Record> {
-    let update_type = read_u32(body, 0)?;
-    let mut data = Record::new().with("update_type", update_type);
-    let mut offset = 4usize;
-    if update_type == 2 {
-        let bal = get_series_size(TRADE_UPDATE_BALANCE_SCHEMA).unwrap();
-        if body.len() >= offset + bal {
-            if let Ok(r) = SeriesCodec::parse_record(body, TRADE_UPDATE_BALANCE_SCHEMA, TRADE_UPDATE_BALANCE_FIELD_NAMES, offset) {
-                data.set("balance_info", r);
-            }
-            offset += bal;
-        }
-        let rest = body.get(offset..).unwrap_or(&[]);
-        data.set("deals", parse_counted_records(rest, DEAL_SCHEMA, DEAL_FIELD_NAMES));
-        let deal_size = get_series_size(DEAL_SCHEMA).unwrap();
-        if let Some(deal_count) = read_u32(body, offset) {
-            offset = offset.saturating_add(4).saturating_add((deal_count as usize).saturating_mul(deal_size));
-        }
-        data.set("positions", parse_counted_records(body.get(offset..).unwrap_or(&[]), POSITION_SCHEMA, POSITION_FIELD_NAMES));
-    } else {
-        let txn = get_series_size(TRADE_TRANSACTION_SCHEMA).unwrap();
-        if body.len() >= offset + txn {
-            if let Ok(r) = SeriesCodec::parse_record(body, TRADE_TRANSACTION_SCHEMA, TRADE_TRANSACTION_FIELD_NAMES, offset) {
-                data.extend(r.0);
-            }
-            offset += txn;
-        }
-        let order = get_series_size(ORDER_SCHEMA).unwrap();
-        if body.len() >= offset + order {
-            if let Ok(r) = SeriesCodec::parse_record(body, ORDER_SCHEMA, ORDER_FIELD_NAMES, offset) {
-                data.set("order", r);
+/// Apply a parsed cmd=10 push to the live position/order maps.
+pub(crate) fn apply_trade_update(st: &mut State, update: &Record) {
+    match update.get_i64("update_type") {
+        2 => {
+            for pos in update.get_records("positions") {
+                let id = pos.get_u64("position_id");
+                if id == 0 { continue; }
+                if pos.get_u64("trade_volume") == 0 { st.live_positions.shift_remove(&id); } else { st.live_positions.insert(id, pos.clone()); }
             }
         }
+        // open-orders update: transaction_type 0 add, 1 update, 2 delete. A cancelled order is *not* deleted this way: it
+        // gets an update with a non-live state (9 = cancel requested) and then a history push (below).
+        0 => {
+            if let Some(order) = update.get_record("order") {
+                let id = order.get_u64("trade_order");
+                if id == 0 { return; }
+                // ORDER_STATE: 0 started, 1 placed, 3 partial, 7/8 add/modify requested are live
+                let live = matches!(order.get_i64("order_state"), 0 | 1 | 3 | 7 | 8);
+                if update.get_i64("transaction_type") == 2 || !live { st.live_orders.shift_remove(&id); } else { st.live_orders.insert(id, order.clone()); }
+            }
+        }
+        // history order added: the order is final (filled / cancelled / rejected / expired)
+        1 => {
+            if let Some(order) = update.get_record("order") { st.live_orders.shift_remove(&order.get_u64("trade_order")); }
+        }
+        _ => {}
     }
-    Some(data)
 }
 
 fn tick_event(tick: &Record) -> TickEvent {
@@ -105,7 +79,7 @@ impl Mt5Client {
     /// Snapshot-parse ticks using the current symbol + tick caches.
     fn parse_ticks(state: &std::sync::Mutex<State>, body: &[u8]) -> RecordList {
         let st = state.lock().unwrap_or_else(|e| e.into_inner());
-        parse_tick_batch(body, &st.symbols_by_id, Some(&st.tick_cache_by_id))
+        parse_tick_batch(body, &st.symbols_by_id, Some(&st.tick_cache_by_id), st.normalize_ticks)
     }
 
     /// Ticks (`cmd=8`). The callback receives all ticks of one push batch.
@@ -244,7 +218,7 @@ impl Mt5Client {
         self.transport().on(CMD_TICK_PUSH, move |r| {
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
             let st = &mut *guard;
-            let ticks = parse_tick_batch(&r.body, &st.symbols_by_id, Some(&st.tick_cache_by_id));
+            let ticks = parse_tick_batch(&r.body, &st.symbols_by_id, Some(&st.tick_cache_by_id), st.normalize_ticks);
             for tick in ticks {
                 let id = tick.get_u64("symbol_id") as u32;
                 st.tick_cache_by_id.insert(id, tick.clone());
@@ -263,6 +237,19 @@ impl Mt5Client {
                     st.tick_cache_by_name.insert(name.to_string(), tick.clone());
                 }
             }
+        });
+        let state = self.inner.state.clone();
+        self.transport().on(CMD_TRADE_UPDATE_PUSH, move |r| {
+            let Some(update) = parse_trade_transaction(&r.body) else { return };
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.trade_state_ready { apply_trade_update(&mut st, &update); }
+        });
+        let state = self.inner.state.clone();
+        self.transport().on(CMD_TRADE_RESULT_PUSH, move |r| {
+            // forward to the trade_request() waiting for this action_id (if any); removal is done by the waiter
+            let data = parse_trade_result_push(&r.body);
+            let id = data.get_u64("action_id") as u32;
+            if let Some(tx) = state.lock().unwrap_or_else(|e| e.into_inner()).trade_waiters.get(&id) { let _ = tx.send(data); }
         });
         let state = self.inner.state.clone();
         self.transport().on(CMD_BOOK_PUSH, move |r| {
@@ -295,3 +282,42 @@ impl Mt5Client {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(id: i64, vol: u64) -> Record { Record::new().with("position_id", id).with("trade_volume", vol) }
+    fn order(id: i64, state: i64) -> Record { Record::new().with("trade_order", id).with("order_state", state) }
+    fn upd(ty: i64, txn: i64, o: Option<Record>, p: Vec<Record>) -> Record {
+        let mut r = Record::new().with("update_type", ty).with("transaction_type", txn);
+        if let Some(o) = o { r.set("order", o); }
+        r.set("positions", p);
+        r
+    }
+
+    #[test]
+    fn live_state_follows_pushes() {
+        let mut st = State::default();
+        // positions: opened, resized, closed (volume 0)
+        apply_trade_update(&mut st, &upd(2, 0, None, vec![pos(7, 100)]));
+        apply_trade_update(&mut st, &upd(2, 0, None, vec![pos(7, 50), pos(8, 10)]));
+        assert_eq!(st.live_positions.len(), 2);
+        assert_eq!(st.live_positions[&7].get_u64("trade_volume"), 50);
+        apply_trade_update(&mut st, &upd(2, 0, None, vec![pos(7, 0)]));
+        assert_eq!(st.live_positions.keys().copied().collect::<Vec<_>>(), vec![8]);
+        // orders: placed -> updated -> cancel requested (state 9) disappears
+        apply_trade_update(&mut st, &upd(0, 0, Some(order(1, 1)), vec![]));
+        apply_trade_update(&mut st, &upd(0, 1, Some(order(1, 1)), vec![]));
+        assert_eq!(st.live_orders.len(), 1);
+        apply_trade_update(&mut st, &upd(0, 1, Some(order(1, 9)), vec![]));
+        assert!(st.live_orders.is_empty());
+        // explicit delete and history push both remove
+        apply_trade_update(&mut st, &upd(0, 0, Some(order(2, 1)), vec![]));
+        apply_trade_update(&mut st, &upd(0, 2, Some(order(2, 1)), vec![]));
+        assert!(st.live_orders.is_empty());
+        apply_trade_update(&mut st, &upd(0, 0, Some(order(3, 1)), vec![]));
+        apply_trade_update(&mut st, &upd(1, 0, Some(order(3, 4)), vec![]));
+        assert!(st.live_orders.is_empty());
+    }
+}

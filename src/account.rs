@@ -65,13 +65,16 @@ impl Mt5Client {
         let data = self.get_positions_and_orders().await?;
         match self.get_account().await {
             Ok(a) if !a.is_empty() => {
+                // margin is not part of the account record: compute it (best effort, falls back to the raw record)
+                let am = self.account_margin_from(&a).await.unwrap_or_else(|e| { debug!("account_margin failed: {e}"); Record::new() });
+                let pick = |k: &str| if am.contains_key(k) { am.get_f64(k) } else { a.get_f64(k) };
                 return Ok(AccountInfo {
                     balance: a.get_f64("balance"),
-                    equity: a.get_f64("equity"),
-                    margin: a.get_f64("margin"),
-                    margin_free: a.get_f64("margin_free"),
-                    margin_level: a.get_f64("margin_level"),
-                    profit: a.get_f64("profit"),
+                    equity: pick("equity"),
+                    margin: pick("margin"),
+                    margin_free: pick("margin_free"),
+                    margin_level: pick("margin_level"),
+                    profit: pick("profit"),
                     credit: a.get_f64("credit"),
                     leverage: a.get_i64("leverage"),
                     currency: a.get_str("currency").to_string(),
