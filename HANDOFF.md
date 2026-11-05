@@ -53,6 +53,9 @@ or extend the example to accept a `DEMO_STD_` prefix) and check each of the foll
 
 Record results in `docs/trading.md` (verification status) and `docs/reference/commands.md`.
 
+### Progress log (update as you go)
+* 4.A DONE (see docs/trading.md). 4.B: `on_reconnect_failed` DONE, `TradeResult::into_result` (uses `Error::Trade`) DONE.
+
 ### B. Improvements already identified (see `docs/contributing.md` section 6)
 * Hedged-margin offsets in `account_margin` (opposite positions of one symbol).
 * Re-price positions continuously (profit/`price_close` are as of the last push); maybe maintain from ticks.

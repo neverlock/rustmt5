@@ -20,6 +20,15 @@ pub struct TradeResult {
     pub request_id: u64,
 }
 
+impl TradeResult {
+    /// Turn an unsuccessful result into [`crate::Error::Trade`] (`?`-friendly):
+    /// `client.buy_market(..).await?.into_result("EURUSD", 1)?`. `action` is the `trade_action` sent.
+    pub fn into_result(self, symbol: &str, action: u32) -> Result<TradeResult, crate::Error> {
+        if self.success { return Ok(self); }
+        Err(crate::Error::Trade { message: self.description, retcode: self.retcode.max(0) as u32, symbol: symbol.to_string(), action })
+    }
+}
+
 impl fmt::Display for TradeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = vec![format!("retcode={}", self.retcode), format!("success={}", self.success), format!("desc='{}'", self.description)];
@@ -210,4 +219,16 @@ pub struct HealthStatus {
     pub last_message_age_secs: Option<f64>,
     pub uptime_seconds: f64,
     pub reconnect_count: u32,
+}
+
+#[cfg(test)]
+mod trade_result_tests {
+    use super::*;
+    #[test]
+    fn into_result_maps_failures() {
+        let ok = TradeResult { retcode: 10009, success: true, ..Default::default() };
+        assert!(ok.into_result("EURUSD", 1).is_ok());
+        let bad = TradeResult { retcode: 10015, description: "Invalid price".into(), ..Default::default() };
+        assert!(matches!(bad.into_result("EURUSD", 5), Err(crate::Error::Trade { retcode: 10015, .. })));
+    }
 }

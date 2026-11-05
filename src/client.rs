@@ -159,6 +159,7 @@ pub(crate) struct Inner {
     heartbeat: Mutex<Option<JoinHandle<()>>>,
     reconnect: Mutex<Option<JoinHandle<()>>>,
     on_disconnect: Mutex<Option<DisconnectCb>>,
+    on_reconnect_failed: Mutex<Option<DisconnectCb>>,
     health_callbacks: Mutex<Vec<HealthCb>>,
 }
 
@@ -188,6 +189,7 @@ impl Mt5Client {
                 heartbeat: Mutex::new(None),
                 reconnect: Mutex::new(None),
                 on_disconnect: Mutex::new(None),
+                on_reconnect_failed: Mutex::new(None),
                 health_callbacks: Mutex::new(Vec::new()),
             }),
         };
@@ -211,6 +213,8 @@ impl Mt5Client {
 
     /// Register a callback fired when the socket drops unexpectedly.
     pub fn on_disconnect(&self, cb: impl Fn() + Send + Sync + 'static) { *self.inner.on_disconnect.lock().unwrap() = Some(Arc::new(cb)); }
+    /// Called once when auto-reconnect has used up all `max_reconnect_attempts` (the client stays disconnected).
+    pub fn on_reconnect_failed(&self, cb: impl Fn() + Send + Sync + 'static) { *self.inner.on_reconnect_failed.lock().unwrap() = Some(Arc::new(cb)); }
 
     pub async fn connect(&self) -> Result<&Self> {
         self.inner.transport.connect().await?;
@@ -351,6 +355,8 @@ impl Mt5Client {
             }
         }
         error!("all {} reconnect attempts exhausted", cfg.max_reconnect_attempts);
+        let cb = self.inner.on_reconnect_failed.lock().unwrap().clone();
+        if let Some(cb) = cb { cb(); }
     }
 
     // ---- health ----
