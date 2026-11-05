@@ -53,12 +53,29 @@ or extend the example to accept a `DEMO_STD_` prefix) and check each of the foll
 
 Record results in `docs/trading.md` (verification status) and `docs/reference/commands.md`.
 
-### Progress log
-* 4.A DONE (see docs/trading.md). 4.B DONE: `on_reconnect_failed`; `TradeResult::into_result` (uses `Error::Trade`); hedged-margin netting (verified vs the terminal: buy 0.01+2.00 / sell 1.00 BTCEURs = 4112.29; `account_margin` aggregates per symbol, nets buy vs sell, charges the net volume at the weighted average price through the tiers); HTTP CONNECT proxy (`ClientConfig.proxy`, tested against a fake proxy only); `ClientConfig.volume_precision` (default 8, configurable, not auto-detected); position records are re-priced from cached ticks in `get_positions_and_orders` (needs the symbol's full spec cached, i.e. a prior `symbol_info`; verified live: `price_close`/`profit` follow the bid); `demo_trade_check -- --prefix STD --symbols A,B`.
-* Margin for calc mode 2 now follows `margin_rates_initial` x account `leverage_rules` tiers; verified vs the Web Terminal (0.01 BTCEURs = 40.37; 0.01 + 2.00 lot = 12175.61, tiers use the symbol's cumulative volume in opening order). Note: symbol spec fields are in the nested `trade` record (an earlier note saying exemode 0 was wrong; it is 2 = market).
-* Still open: more broker margin comparisons (stocks/indices, a non-zero `margin_hedged`; `order_calc_margin` ignores netting with existing opposite positions); instant/exchange execution modes (none seen); a live run of the hedged-margin offset and of the proxy.
+### Progress log (state at the last handoff: master `5de9236` or later; 46 unit + 9 integration tests, clippy clean)
+**Done and verified live on the standard USD demo account (CXMDirect-Demo, USD, 1:2000, hedging):**
+* 4.A all items (docs/trading.md has the table). Fixed: stop-limit price mapping (`price_order` = stop price, `price_trigger` = limit price), close-by local state (push has no position records), late pushes of finished orders, conversion-symbol auto-subscribe, shortest suffixed symbol name.
+* 4.B all items: `on_reconnect_failed`; `TradeResult::into_result`; HTTP CONNECT proxy (`ClientConfig.proxy`, only tested against a fake proxy); `ClientConfig.volume_precision` (default 8, not auto-detected); position records re-priced from cached ticks (needs `symbol_info` cached); `demo_trade_check -- --prefix STD --symbols A,B`.
+* Margin (`account_margin`) matches the Web Terminal on 6 data points: BTCEURs 0.01 = 40.37; 0.01+2.00 = 12175.61; +sell 1.00 = 4112.29; BTCUSDs 0.01 = 3.22, 0.02 = 6.43, buy 0.02 + sell 0.07 = 16.08.
+  Rule: per symbol, hedged volume `min(buy,sell)` costs `margin_hedged` (0 here), the net volume is charged at the volume-weighted average margin per lot of the larger side x `margin_rates_initial` x the account `leverage_rules` tier factor (rules matched on `trade.symbol_path`, tiers = ranges of the net volume in lots, rate applies per range). Calc mode 2 ignores the account leverage.
+* Symbol spec fields live in the nested `trade` record (`info.get_record("trade")`); every symbol seen is market execution (`trade_exemode` 2, `trade_fill_flags` 3).
+* The demo std account was left with 0 positions / 0 orders (balance about 99159 USD).
 
-### B. Improvements already identified (see `docs/contributing.md` section 6)
+**Still open (nothing is half-done in the tree):**
+1. More broker margin comparisons: stocks/indices (calc mode 2, other rules), BTCUSDs above 2 lots (second tier), forex/metals (mode 0, `margin_rates_initial` = 1.0 so far), a symbol with `margin_hedged != 0`.
+2. `order_calc_margin` prices one order and ignores netting against existing opposite positions (it only uses same-side volume as the tier start).
+3. Live run of the HTTP proxy; live run with `margin_hedged != 0`.
+4. Instant/exchange execution modes: never seen on this server (code paths only unit-tested).
+5. Position `profit` re-pricing ignores commission/swap (same as the push values); the cmd 14 account push was never observed.
+6. Housekeeping: delete the stale branch `claude/bold-cerf-guqm8b` on GitHub; the cloud branch `claude/funny-knuth-mbjavq` mirrors master.
+
+**Rules that bit in practice:** read the account only unless asked to trade; the user opens/closes positions by hand in the Web Terminal and reports the terminal's margin - compare with `account_margin()` (read-only probe in `examples/scratch_probe.rs`, delete before committing). Using the cent account (`DEMO_*`) for comparisons was refused by the permission system - ask first.
+
+**Suggested prompt for the next session:**
+> Read HANDOFF.md in neverlock/rustmt5 (master) and continue from "Progress log -> Still open". Check that DEMO_STD_LOGIN / DEMO_STD_PASSWORD exist in ENV (names and lengths only, never print values). Use only the demo std USD account, never the real account. Start with item 1: I will open positions by hand in the Web Terminal and give you the terminal's margin; compare it with `account_margin()` read-only and fix the formula if it differs. Commit small, run `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` before each push, and push to master.
+
+### B. (historical) Improvements list - all items below are DONE, kept for reference (see the Progress log)
 * Hedged-margin offsets in `account_margin` (opposite positions of one symbol).
 * Re-price positions continuously (profit/`price_close` are as of the last push); maybe maintain from ticks.
 * `on_reconnect_failed` callback after the last reconnect attempt.
