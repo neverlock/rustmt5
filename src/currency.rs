@@ -57,7 +57,11 @@ impl Mt5Client {
         if st.symbols.contains_key(&direct) { return Ok(Some(direct)); }
         let mut matches: Vec<&String> = st.symbols.keys().filter(|n| n.starts_with(base) && n.ends_with(quote)).collect();
         matches.sort();
-        Ok(matches.first().map(|s| (*s).clone()))
+        if let Some(m) = matches.first() { return Ok(Some((*m).clone())); }
+        // Broker suffixes (e.g. "EURUSDp", "EURUSD.m"): pymt5's startswith/endswith rule misses these.
+        let mut suffixed: Vec<&String> = st.symbols.keys().filter(|n| n.starts_with(&direct)).collect();
+        suffixed.sort();
+        Ok(suffixed.first().map(|s| (*s).clone()))
     }
 
     fn get_conversion_prices(&self, symbol_name: &str, current_symbol: &str, fallback: f64) -> Option<(f64, f64)> {

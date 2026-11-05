@@ -14,6 +14,10 @@ AesCipher      (AES-CBC, zero IV, PKCS7; key from the bootstrap handshake)
 SeriesCodec    (schema driven binary serialisation; schemas generated from pymt5/schemas.py)
 ```
 
+## Documentation
+
+Developer docs (architecture, wire protocol, per-module internals, testing, contributing) are in [`docs/`](docs/README.md).
+
 ## Quick start
 
 ```rust
@@ -78,6 +82,7 @@ real structs.
 
 ```bash
 cargo test            # unit tests + end-to-end tests against an in-process mock MT5 server
+cargo doc --no-deps   # API docs
 cargo clippy --all-targets
 ```
 

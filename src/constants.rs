@@ -78,3 +78,7 @@ pub fn retcode_description(code: u32) -> Option<&'static str> {
 pub fn retcode_text(code: u32) -> String {
     retcode_description(code).map(str::to_string).unwrap_or_else(|| format!("Unknown retcode {code}"))
 }
+
+/// Decimal digits of the integer volume encoding used by the Web Terminal: `1.0 lot == 10^8`.
+/// Volumes in trade requests *and* the `volume_min/max/step/limit` fields of symbol info use it.
+pub const VOLUME_PRECISION: i32 = 8;

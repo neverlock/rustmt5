@@ -234,6 +234,19 @@ pub fn to_copy_tick_record(tick: &Record) -> Record {
 
 // ---- order request validation ----
 
+/// Copy of a symbol-info record whose `volume_min/max/step/limit` are converted from the wire
+/// integer encoding (`lots * 10^VOLUME_PRECISION`) to lots, so they can be compared with user volumes.
+pub fn symbol_info_volumes_in_lots(info: &Record) -> Record {
+    let scale = 10f64.powi(VOLUME_PRECISION);
+    let mut out = info.clone();
+    for key in ["volume_min", "volume_max", "volume_step", "volume_limit"] {
+        if info.contains_key(key) { out.set(key, info.get_f64(key) / scale); }
+    }
+    out
+}
+
+/// Validate `volume` (in lots) against `volume_min/max/step` of `symbol_info` **expressed in lots**
+/// (use [`symbol_info_volumes_in_lots`] for records straight from the server).
 pub fn validate_requested_volume(symbol_info: &Record, volume: f64) -> Option<String> {
     let vmin = symbol_info.get_f64("volume_min");
     let vmax = symbol_info.get_f64("volume_max");
@@ -713,6 +726,22 @@ mod tests {
         let req = Record::new().with("sl", 1.0999f64);
         assert!(validate_requested_stops(&info, &req, 1.1).unwrap().contains("sl"));
         assert!(validate_requested_stops(&info, &Record::new().with("sl", 1.0f64), 1.1).is_none());
+    }
+
+    #[test]
+    fn wire_volumes_are_converted_to_lots() {
+        // as sent by the server: 0.01 lot min/step, 1000 lots max
+        let raw = Record::new().with("volume_min", 1_000_000u64).with("volume_step", 1_000_000u64).with("volume_max", 100_000_000_000u64);
+        assert!(validate_requested_volume(&raw, 0.01).is_some(), "raw wire units must not be compared with lots");
+        let info = symbol_info_volumes_in_lots(&raw);
+        assert_eq!(info.get_f64("volume_min"), 0.01);
+        assert_eq!(info.get_f64("volume_max"), 1000.0);
+        assert!(validate_requested_volume(&info, 0.01).is_none());
+        assert!(validate_requested_volume(&info, 0.37).is_none());
+        assert!(validate_requested_volume(&info, 0.001).unwrap().contains("below"));
+        assert!(validate_requested_volume(&info, 1000.01).unwrap().contains("above"));
+        assert!(validate_requested_volume(&info, 0.015).unwrap().contains("step"));
+        assert!(!symbol_info_volumes_in_lots(&Record::new()).contains_key("volume_min"));
     }
 
     #[test]

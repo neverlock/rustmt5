@@ -348,7 +348,9 @@ impl Mt5Client {
         let profit = account.get_f64("profit");
         let margin = account.get_f64("margin");
         let ok_codes = [0i64, TRADE_RETCODE_PLACED as i64, TRADE_RETCODE_DONE as i64, TRADE_RETCODE_DONE_PARTIAL as i64];
-        let additional = if ok_codes.contains(&retcode) { self.estimate_order_margin(&normalized).await? } else { 0.0 };
+        let estimate = if ok_codes.contains(&retcode) { self.estimate_order_margin(&normalized).await? } else { Some(0.0) };
+        let margin_known = estimate.is_some();
+        let additional = estimate.unwrap_or(0.0);
         let margin_post = margin + additional;
         let margin_free = equity - margin_post;
         let margin_level = if margin_post <= 0.0 { 0.0 } else { (equity / margin_post) * 100.0 };
@@ -366,6 +368,9 @@ impl Mt5Client {
             .with("margin_free", margin_free)
             .with("margin_level", margin_level)
             .with("comment", comment)
+            // false when the margin could not be computed (e.g. no conversion rate); margin/margin_free
+            // then only reflect the existing account margin, so a "passing" check is not conclusive.
+            .with("margin_known", margin_known)
             .with("request", normalized))
     }
 
@@ -411,7 +416,7 @@ impl Mt5Client {
         if trade_mode == 1 && side == Some(false) { return Ok(Some((TRADE_RETCODE_INVALID_ORDER as i64, "symbol is long-only".into()))); }
         if trade_mode == 2 && side == Some(true) { return Ok(Some((TRADE_RETCODE_INVALID_ORDER as i64, "symbol is short-only".into()))); }
         if trade_mode == 3 { return Ok(Some((TRADE_RETCODE_TRADE_DISABLED as i64, "symbol is close-only".into()))); }
-        if let Some(msg) = validate_requested_volume(info, volume) { return Ok(Some((TRADE_RETCODE_INVALID_VOLUME as i64, msg))); }
+        if let Some(msg) = validate_requested_volume(&symbol_info_volumes_in_lots(info), volume) { return Ok(Some((TRADE_RETCODE_INVALID_VOLUME as i64, msg))); }
         let expiration = request.get_i64("expiration");
         let type_time = if request.contains_key("type_time") { request.get_i64("type_time") } else { ORDER_TIME_GTC };
         if (type_time == ORDER_TIME_SPECIFIED || type_time == ORDER_TIME_SPECIFIED_DAY) && expiration <= 0 {
@@ -453,13 +458,14 @@ impl Mt5Client {
         Ok((0, retcode_description(0).unwrap_or("OK").to_string()))
     }
 
-    async fn estimate_order_margin(&self, request: &Record) -> Result<f64> {
+    /// `Some(0.0)` when no margin applies, `None` when it could not be computed.
+    async fn estimate_order_margin(&self, request: &Record) -> Result<Option<f64>> {
         let action = request.get_i64("action");
-        if action != TRADE_ACTION_DEAL && action != TRADE_ACTION_PENDING { return Ok(0.0); }
+        if action != TRADE_ACTION_DEAL && action != TRADE_ACTION_PENDING { return Ok(Some(0.0)); }
         let info = self.symbol_info(request.get_str("symbol")).await?;
         let price = self.resolve_order_check_price(request, info.as_ref());
-        if price <= 0.0 { return Ok(0.0); }
-        Ok(self.order_calc_margin(request.get_i64("type"), request.get_str("symbol"), request.get_f64("volume"), price).await?.unwrap_or(0.0))
+        if price <= 0.0 { return Ok(None); }
+        self.order_calc_margin(request.get_i64("type"), request.get_str("symbol"), request.get_f64("volume"), price).await
     }
 
     fn resolve_order_check_price(&self, request: &Record, symbol_info: Option<&Record>) -> f64 {

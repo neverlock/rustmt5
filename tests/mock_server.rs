@@ -171,7 +171,13 @@ async fn serve_connection(stream: tokio::net::TcpStream, b: Behavior) {
                         FULL_SYMBOL_SCHEMA,
                         FULL_SYMBOL_FIELD_NAMES,
                         &[("trade_symbol", Value::Str("EURUSD".into())), ("symbol_id", Value::UInt(id as u64)), ("digits", Value::UInt(5)),
-                          ("contract_size", Value::Float(100000.0)), ("currency_profit", Value::Str("USD".into()))],
+                          ("point", Value::Float(0.00001)), ("contract_size", Value::Float(100000.0)), ("currency_profit", Value::Str("USD".into())),
+                          ("trade", Value::Bytes(record_bytes(
+                              ACCOUNT_WEB_TRADE_SETTINGS_SCHEMA,
+                              ACCOUNT_WEB_TRADE_SETTINGS_FIELD_NAMES,
+                              &[("trade_mode", Value::Int(4)), ("volume_min", Value::UInt(1_000_000)), ("volume_step", Value::UInt(1_000_000)),
+                                ("volume_max", Value::UInt(100_000_000_000))],
+                          )))],
                     ));
                     ws.send(Message::Binary(frame(&cipher, 18, 0, &body).into())).await.unwrap();
                 }
@@ -295,6 +301,19 @@ async fn account_symbols_ticks_and_trade() {
     assert_eq!((full.get_i64("digits"), full.get_f64("contract_size"), full.get_str("currency_profit")), (5, 100000.0, "USD"));
     assert!(c.get_full_symbol_info("UNKNOWN").await.unwrap().is_none());
     assert_eq!(c.symbol_info("EURUSD").await.unwrap().unwrap().get_str("currency_profit"), "USD");
+
+    // order_check: server volume limits are wire-encoded (0.01 lot = 1_000_000); user volumes are lots
+    let req = |vol: f64| Record::new().with("action", 1i64).with("symbol", "EURUSD").with("volume", vol).with("type", 0i64).with("price", 1.1f64);
+    let ok = c.order_check(&req(0.01)).await.unwrap();
+    assert_eq!(ok.get_i64("retcode"), 0, "{ok:?}");
+    assert!((ok.get_f64("margin") - 10.0).abs() < 1e-9, "100000*0.01/100 leverage = 10: {ok:?}");
+    assert!(ok.get_bool("margin_known"));
+    assert_eq!(c.order_check(&req(0.37)).await.unwrap().get_i64("retcode"), 0);
+    let low = c.order_check(&req(0.001)).await.unwrap();
+    assert_eq!((low.get_i64("retcode"), low.get_str("comment").contains("below")), (10014, true));
+    assert_eq!(c.order_check(&req(0.015)).await.unwrap().get_i64("retcode"), 10014);
+    assert_eq!(c.order_check(&req(2000.0)).await.unwrap().get_i64("retcode"), 10014, "above symbol maximum");
+    assert_eq!(c.order_check(&req(50.0)).await.unwrap().get_i64("retcode"), 10019, "not enough money");
 
     let pos = c.get_positions_and_orders().await.unwrap();
     assert!(pos.positions.is_empty() && pos.orders.is_empty());
