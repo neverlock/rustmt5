@@ -630,3 +630,18 @@ async fn external_link_connector_handshake_login_ping() {
     c.close().await;
     assert_eq!(b.logins.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn command_filter_blocks_before_anything_is_sent() {
+    let b = Behavior::default();
+    let uri = start(b.clone()).await;
+    // cmd 12 is the trade request; everything else is allowed
+    let filter: rustmt5::CommandFilter = Arc::new(|cmd| cmd != 12);
+    let c = Mt5Client::new(ClientConfig { command_filter: Some(filter), ..cfg(uri) });
+    c.connect().await.unwrap();
+    c.login(12345678, "secret").await.unwrap();
+    let err = c.transport().send_command(12, &[0u8; 8]).await.unwrap_err();
+    assert!(format!("{err}").contains("blocked by policy"), "{err}");
+    assert!(b.requests.lock().unwrap().is_empty(), "blocked command must not reach the server");
+    c.close().await;
+}

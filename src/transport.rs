@@ -52,6 +52,9 @@ pub trait LinkConnector: Send + Sync {
     fn connect<'a>(&'a self, uri: &'a str) -> LinkFuture<'a>;
 }
 
+/// Policy hook run before every command is sent; return `false` to refuse it (e.g. block trade requests).
+pub type CommandFilter = Arc<dyn Fn(u16) -> bool + Send + Sync>;
+
 enum Sink {
     Ws(WsSink),
     Chan(mpsc::Sender<Vec<u8>>),
@@ -102,6 +105,7 @@ struct Inner {
     state: Mutex<TransportState>,
     sink: AsyncMutex<Option<Sink>>,
     link_connector: Mutex<Option<Arc<dyn LinkConnector>>>,
+    command_filter: Mutex<Option<CommandFilter>>,
     cipher: RwLock<AesCipher>,
     token: Mutex<Vec<u8>>,
     pending: Mutex<HashMap<u16, VecDeque<(u64, Waiter)>>>,
@@ -143,6 +147,7 @@ impl Transport {
                 state: Mutex::new(TransportState::Disconnected),
                 sink: AsyncMutex::new(None),
                 link_connector: Mutex::new(None),
+                command_filter: Mutex::new(None),
                 cipher: RwLock::new(initial_cipher()),
                 token: Mutex::new(vec![0; DEFAULT_TOKEN_LENGTH]),
                 pending: Mutex::new(HashMap::new()),
@@ -196,6 +201,9 @@ impl Transport {
     /// Open the socket, run the bootstrap handshake and switch to the session key.
     /// Route the WebSocket through an HTTP `CONNECT` proxy (`http://[user:pass@]host:port`); `None` = direct.
     pub fn set_proxy(&self, proxy: Option<String>) { *self.inner.proxy.lock().unwrap() = proxy; }
+
+    /// Refuse commands for which `filter(command)` is `false` with a protocol error before anything is sent.
+    pub fn set_command_filter(&self, filter: Option<CommandFilter>) { *self.inner.command_filter.lock().unwrap() = filter; }
 
     /// Use an externally supplied socket instead of the built-in tungstenite connection.
     pub fn set_link_connector(&self, connector: Option<Arc<dyn LinkConnector>>) { *self.inner.link_connector.lock().unwrap() = connector; }
@@ -337,6 +345,12 @@ impl Transport {
     async fn send_raw(&self, command: u16, payload: &[u8], check_ready: bool) -> Result<CommandResult> {
         if !VALID_COMMANDS.contains(&command) {
             return Err(Error::protocol(format!("unsupported command: {command}")));
+        }
+        let filter = self.inner.command_filter.lock().unwrap().clone();
+        if let Some(filter) = filter {
+            if !filter(command) {
+                return Err(Error::protocol(format!("command {command} blocked by policy")));
+            }
         }
         if check_ready && !self.is_ready() {
             return Err(Error::session(format!("transport not ready for command {command}")));
