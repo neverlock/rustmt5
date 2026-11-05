@@ -50,14 +50,37 @@ pub(crate) fn apply_trade_update(st: &mut State, update: &Record) {
                 if id == 0 { return; }
                 // ORDER_STATE: 0 started, 1 placed, 3 partial, 7/8 add/modify requested are live
                 let live = matches!(order.get_i64("order_state"), 0 | 1 | 3 | 7 | 8);
-                if update.get_i64("transaction_type") == 2 || !live { st.live_orders.shift_remove(&id); } else { st.live_orders.insert(id, order.clone()); }
+                if update.get_i64("transaction_type") == 2 || !live { st.live_orders.shift_remove(&id); remember_finished_order(st, id); }
+                // order ids are never reused: a late "live" update of an already finished order must not resurrect it
+                else if !st.finished_orders.contains(&id) { st.live_orders.insert(id, order.clone()); }
             }
         }
         // history order added: the order is final (filled / cancelled / rejected / expired)
         1 => {
-            if let Some(order) = update.get_record("order") { st.live_orders.shift_remove(&order.get_u64("trade_order")); }
+            if let Some(order) = update.get_record("order") {
+                let id = order.get_u64("trade_order");
+                st.live_orders.shift_remove(&id);
+                remember_finished_order(st, id);
+            }
         }
         _ => {}
+    }
+}
+
+fn remember_finished_order(st: &mut State, id: u64) {
+    if st.finished_orders.len() >= 4096 { st.finished_orders.clear(); }
+    st.finished_orders.insert(id);
+}
+
+/// Close-by (`TRADE_ACTION_CLOSE_BY`): the server's cmd 10 push for it carries **no position records** (verified live,
+/// build 6182), so the local state is updated from the request: both positions lose `min(volume)`; zero volume removes.
+pub(crate) fn apply_close_by(st: &mut State, position_id: u64, position_by: u64) {
+    let (Some(a), Some(b)) = (st.live_positions.get(&position_id), st.live_positions.get(&position_by)) else { return };
+    let closed = a.get_u64("trade_volume").min(b.get_u64("trade_volume"));
+    for id in [position_id, position_by] {
+        let Some(p) = st.live_positions.get_mut(&id) else { continue };
+        let left = p.get_u64("trade_volume").saturating_sub(closed);
+        if left == 0 { st.live_positions.shift_remove(&id); } else { p.set("trade_volume", left); }
     }
 }
 
@@ -319,5 +342,19 @@ mod tests {
         apply_trade_update(&mut st, &upd(0, 0, Some(order(3, 1)), vec![]));
         apply_trade_update(&mut st, &upd(1, 0, Some(order(3, 4)), vec![]));
         assert!(st.live_orders.is_empty());
+        // late out-of-order "live" push of a finished order is ignored
+        apply_trade_update(&mut st, &upd(0, 0, Some(order(3, 0)), vec![]));
+        assert!(st.live_orders.is_empty());
+    }
+
+    #[test]
+    fn close_by_updates_local_positions() {
+        let mut st = State::default();
+        apply_trade_update(&mut st, &upd(2, 0, None, vec![pos(1, 200), pos(2, 200), pos(3, 500), pos(4, 200)]));
+        apply_close_by(&mut st, 1, 2); // equal volumes: both gone
+        assert_eq!(st.live_positions.keys().copied().collect::<Vec<_>>(), vec![3, 4]);
+        apply_close_by(&mut st, 3, 4); // different volumes: the larger one keeps the difference
+        assert_eq!(st.live_positions.keys().copied().collect::<Vec<_>>(), vec![3]);
+        assert_eq!(st.live_positions[&3].get_u64("trade_volume"), 300);
     }
 }

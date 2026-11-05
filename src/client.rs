@@ -148,6 +148,8 @@ pub(crate) struct State {
     pub live_positions: IndexMap<u64, Record>,
     pub live_orders: IndexMap<u64, Record>,
     pub trade_state_ready: bool,
+    /// Recently finished order ids (so a late push cannot re-add them to `live_orders`).
+    pub finished_orders: std::collections::HashSet<u64>,
 }
 
 pub(crate) struct Inner {
@@ -425,6 +427,7 @@ impl Mt5Client {
             st.bootstrap_pristine = false;
             st.live_positions.clear();
             st.live_orders.clear();
+            st.finished_orders.clear();
             st.trade_state_ready = false;
         }
         let payload = self.build_login_payload(&p)?;

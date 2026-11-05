@@ -1,8 +1,25 @@
 # Trading (`trading.rs`, `order_helpers.rs`, `currency.rs`)
 
-> **Verification status.** Verified against a real **demo** account (CXMDirect-Demo, build 6182): market open/close, pending place/modify/cancel,
-> SL/TP modify, `order_send`/`order_check`, live positions/orders, margin. **Never run against a real-money account.** Not verified: partial close,
-> close-by, instant/exchange execution modes, stop-limit orders, hedged-margin accounts' offsets.
+> **Verification status.** Verified against real **demo** accounts (CXMDirect-Demo, build 6182): market open/close, partial close, close-by, pending
+> place/modify/cancel (incl. stop-limit and `SPECIFIED` expiration), SL/TP modify, `order_send`/`order_check`, live positions/orders, margin.
+> **Never run against a real-money account.** Not verified: instant/exchange execution modes (every symbol checked on the standard USD account reports
+> `trade_exemode = 0`), hedged-margin offsets, margin of CFD/stock/index symbols against the broker's own numbers.
+
+### Standard USD demo account (1:2000, hedging) - results
+
+| item | result |
+|---|---|
+| margin/profit conversions | EURUSD, USDJPY, XAUUSD (margin ccy XAU), EURGBP (profit ccy GBP) all convert to USD; conversion symbols are now auto-subscribed, and the shortest suffixed name wins (`XAUUSDs`, not `XAUUSD247s`) |
+| CFD/index/crypto margin | `calc_mode 2` gives `lots * contract * price` (no leverage), e.g. 0.1 lot US30 = 53593 USD. **Unverified against the broker** - compare with the terminal's margin before trusting it |
+| execution modes | `trade_exemode`, `trade_fill_flags`, `trade_instant_volume` are 0 for forex/metal/crypto/stock/index samples; `volume_min = step = 0.01 lot` |
+| stop-limit | wire mapping is `price_order` = **stop (activation) price**, `price_trigger` = **limit price** (buy: limit < stop, else `10015`). Earlier code had the two swapped |
+| partial close | position record keeps the id, volume reduced, margin follows |
+| close-by | success, but the cmd 10 push has **no position records**; the local state is now updated from the request (`apply_close_by`) |
+| SL/TP change | position record (`sl`/`tp`) is updated by the push |
+| expiration | `type_time = 2` + `time_expiration` works (rounded to the minute). The server clock was ~7200 s ahead of the local clock, so use server time (e.g. a `time_create` from a position) when computing an expiry |
+| `get_account` | current after trades (balance/equity/profit); no cmd 14 push was observed within 3 s |
+| tick scaling | prices are real values on this server (EURUSD 1.126) |
+| order bookkeeping | finished order ids are remembered so a late/out-of-order push cannot resurrect them in `live_orders` |
 
 ## 1. How an order really works on this server
 
@@ -77,7 +94,7 @@ client.cancel_pending_order(order).await?;
 |---|---|---|
 | `buy_market`/`sell_market` | by exemode (table above) | reference price = `options.price`, else cached tick (ask for buy, bid for sell) |
 | `buy_limit`/`sell_limit`/`buy_stop`/`sell_stop` | 5 | |
-| `buy_stop_limit`/`sell_stop_limit` | 5 | `price` = stop trigger -> `price_trigger`; `stop_limit_price` -> `price_order` |
+| `buy_stop_limit`/`sell_stop_limit` | 5 | `price` = stop (activation) price -> `price_order`; `stop_limit_price` -> `price_trigger` (buy: limit < stop, else `10015`; verified live) |
 | `close_position(id, volume, opts)` | by exemode | looks the position up (side, symbol, current price); opposite `trade_type`, `type_flags = 3` |
 | `close_position_by(id, by)` | 10 | both positions must be of the same symbol and opposite |
 | `modify_position_sltp(id, sl, tp)` | 6 | `None` keeps, `Some(0.0)` removes |
@@ -164,7 +181,7 @@ The conversion pair needs a **tick subscription** (or be the symbol itself); oth
 |---|---|
 | DEAL (1), no `position` | `buy_market` / `sell_market` (by `type`) |
 | DEAL (1), with `position` | `close_position(position, volume or whole)` |
-| PENDING (5) | pending order of `type` (stop-limit: `price` = trigger, `stoplimit` = limit price) |
+| PENDING (5) | pending order of `type` (stop-limit: `price` = stop/activation price, `stoplimit` = limit price) |
 | SLTP (6) | `modify_position_sltp(position, sl, tp)` (keys absent = keep) |
 | MODIFY (7) | `modify_pending_order(order, ...)` |
 | REMOVE (8) | `cancel_pending_order(order)` |

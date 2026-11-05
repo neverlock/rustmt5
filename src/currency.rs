@@ -46,12 +46,12 @@ impl Mt5Client {
 
     async fn resolve_side_rate(&self, source: &str, target: &str, prefer_ask_when_direct: bool, current_symbol: &str, fallback: f64) -> Result<f64> {
         if let Some(direct) = self.find_conversion_symbol_name(source, target).await? {
-            if let Some((bid, ask)) = self.get_conversion_prices(&direct, current_symbol, fallback) {
+            if let Some((bid, ask)) = self.conversion_prices_subscribing(&direct, current_symbol, fallback).await {
                 return Ok(if prefer_ask_when_direct { ask } else { bid });
             }
         }
         if let Some(inverse) = self.find_conversion_symbol_name(target, source).await? {
-            if let Some((bid, ask)) = self.get_conversion_prices(&inverse, current_symbol, fallback) {
+            if let Some((bid, ask)) = self.conversion_prices_subscribing(&inverse, current_symbol, fallback).await {
                 let denominator = if prefer_ask_when_direct { bid } else { ask };
                 if denominator > 0.0 { return Ok(1.0 / denominator); }
             }
@@ -77,9 +77,21 @@ impl Mt5Client {
         matches.sort();
         if let Some(m) = matches.first() { return Ok(Some((*m).clone())); }
         // Broker suffixes (e.g. "EURUSDp", "EURUSD.m"): pymt5's startswith/endswith rule misses these.
-        let mut suffixed: Vec<&String> = st.symbols.keys().filter(|n| n.starts_with(&direct)).collect();
-        suffixed.sort();
-        Ok(suffixed.first().map(|s| (*s).clone()))
+        // Prefer the shortest name (`XAUUSDs` over `XAUUSD247s`), then alphabetical.
+        let suffixed = st.symbols.keys().filter(|n| n.starts_with(&direct)).min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        Ok(suffixed.cloned())
+    }
+
+    /// Conversion prices; when the symbol has no cached tick yet it is subscribed and the first tick awaited (max ~3 s).
+    async fn conversion_prices_subscribing(&self, symbol_name: &str, current_symbol: &str, fallback: f64) -> Option<(f64, f64)> {
+        if let Some(p) = self.get_conversion_prices(symbol_name, current_symbol, fallback) { return Some(p); }
+        let id = self.get_symbol_id(symbol_name)?;
+        if let Err(e) = self.subscribe_ticks(&[id]).await { debug!("could not subscribe conversion symbol {symbol_name}: {e}"); return None; }
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if let Some(p) = self.get_conversion_prices(symbol_name, current_symbol, fallback) { return Some(p); }
+        }
+        None
     }
 
     fn get_conversion_prices(&self, symbol_name: &str, current_symbol: &str, fallback: f64) -> Option<(f64, f64)> {

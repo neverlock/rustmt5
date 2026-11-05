@@ -411,7 +411,7 @@ impl Mt5Client {
                 }
             }
             TRADE_ACTION_PENDING => {
-                let (order_price, trigger) = if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (request.get_f64("stoplimit"), price) } else { (price, 0.0) };
+                let (order_price, trigger) = if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (price, request.get_f64("stoplimit")) } else { (price, 0.0) };
                 if order_side(order_type).is_none() || order_type <= ORDER_TYPE_SELL { return Err(Error::validation(format!("PENDING needs a pending order type (2..7), got {order_type}"))); }
                 let o = PendingOrderOptions {
                     sl: request.get_f64("sl"), tp: request.get_f64("tp"), comment: request.get_str("comment").to_string(), filling,
@@ -424,8 +424,8 @@ impl Mt5Client {
             TRADE_ACTION_MODIFY => {
                 let stop_limit = order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT;
                 self.modify_pending_order(request.get_u64("order"), &ModifyOrderOptions {
-                    price: if stop_limit { opt("stoplimit") } else { opt("price") },
-                    trigger: if stop_limit { opt("price") } else { None },
+                    price: opt("price"),
+                    trigger: if stop_limit { opt("stoplimit") } else { None },
                     sl: opt("sl"), tp: opt("tp"),
                     time_type: request.contains_key("type_time").then(|| request.get_i64("type_time")),
                     expiration: request.contains_key("expiration").then(|| coerce_value_timestamp(request.get("expiration"))),
@@ -506,7 +506,7 @@ impl Mt5Client {
         let price = request.get_f64("price");
         let stoplimit = request.get_f64("stoplimit");
         let (price_order, price_trigger) =
-            if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (stoplimit, price) } else { (price, 0.0) };
+            if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT { (price, stoplimit) } else { (price, 0.0) };
         Record::new()
             .with("action", request.get_i64("action"))
             .with("symbol", request.get_str("symbol"))
@@ -600,11 +600,7 @@ impl Mt5Client {
         let action = request.get_i64("action");
         let order_type = request.get_i64("type");
         if action == TRADE_ACTION_PENDING {
-            return if order_type == ORDER_TYPE_BUY_STOP_LIMIT || order_type == ORDER_TYPE_SELL_STOP_LIMIT {
-                request.get_f64("price_trigger")
-            } else {
-                request.get_f64("price_order")
-            };
+            return request.get_f64("price_order"); // stop-limit too: price_order is the stop (activation) price
         }
         let mut price = request.get_f64("price_order");
         if price == 0.0 { price = request.get_f64("price"); }

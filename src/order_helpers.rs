@@ -209,13 +209,14 @@ impl Mt5Client {
     pub async fn buy_stop(&self, symbol: &str, volume: f64, price: f64, o: &PendingOrderOptions) -> Result<TradeResult> { self.open_pending(symbol, volume, ORDER_TYPE_BUY_STOP, price, 0.0, o).await }
     pub async fn sell_stop(&self, symbol: &str, volume: f64, price: f64, o: &PendingOrderOptions) -> Result<TradeResult> { self.open_pending(symbol, volume, ORDER_TYPE_SELL_STOP, price, 0.0, o).await }
 
-    /// Buy stop-limit: `price` is the stop trigger, `stop_limit_price` the limit placed after the trigger.
+    /// Buy stop-limit: `price` is the stop (activation) price -> `price_order`; `stop_limit_price` the limit placed
+    /// after activation -> `price_trigger` (verified live: a buy needs `stop_limit_price < price`, else `10015`).
     pub async fn buy_stop_limit(&self, symbol: &str, volume: f64, price: f64, stop_limit_price: f64, o: &PendingOrderOptions) -> Result<TradeResult> {
-        self.open_pending(symbol, volume, ORDER_TYPE_BUY_STOP_LIMIT, stop_limit_price, price, o).await
+        self.open_pending(symbol, volume, ORDER_TYPE_BUY_STOP_LIMIT, price, stop_limit_price, o).await
     }
 
     pub async fn sell_stop_limit(&self, symbol: &str, volume: f64, price: f64, stop_limit_price: f64, o: &PendingOrderOptions) -> Result<TradeResult> {
-        self.open_pending(symbol, volume, ORDER_TYPE_SELL_STOP_LIMIT, stop_limit_price, price, o).await
+        self.open_pending(symbol, volume, ORDER_TYPE_SELL_STOP_LIMIT, price, stop_limit_price, o).await
     }
 
     /// Positions and orders reported by the server lag a few seconds behind a trade: look a few times.
@@ -272,7 +273,7 @@ impl Mt5Client {
         if pos.get_str("trade_symbol") != other.get_str("trade_symbol") || pos.get_i64("trade_action") == other.get_i64("trade_action") {
             return Err(Error::validation("close-by needs two opposite positions of the same symbol"));
         }
-        self.trade_request(&TradeRequest {
+        let result = self.trade_request(&TradeRequest {
             trade_action: TRADE_ACTION_CLOSE_BY,
             symbol: pos.get_str("trade_symbol").to_string(),
             volume: pos.get_u64("trade_volume").min(other.get_u64("trade_volume")),
@@ -284,7 +285,10 @@ impl Mt5Client {
             position_by,
             ..Default::default()
         })
-        .await
+        .await?;
+        // the server's push has no position records for a close-by: update the local state ourselves
+        if result.success { crate::push_handlers::apply_close_by(&mut self.st(), position_id, position_by); }
+        Ok(result)
     }
 
     /// Change SL/TP of a position; `None` keeps the current value, `Some(0.0)` removes it.
