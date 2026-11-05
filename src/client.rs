@@ -51,6 +51,8 @@ pub struct ClientConfig {
     pub symbol_cache_ttl: f64,
     /// Extra PEM root CA bundle to trust in addition to the built-in roots
     /// (defaults to the `SSL_CERT_FILE` environment variable when unset).
+    /// HTTP `CONNECT` proxy for the WebSocket, `http://[user:pass@]host:port`. `None` = direct TCP (the default).
+    pub proxy: Option<String>,
     pub ca_bundle: Option<std::path::PathBuf>,
     /// Undo the "scaled integer" tick price heuristic ported from pymt5 (see docs/market-data.md).
     /// Set to `false` for servers that already send real prices (e.g. CXMDirect build 6182).
@@ -74,6 +76,7 @@ impl Default for ClientConfig {
             metrics: None,
             symbol_cache_ttl: 0.0,
             ca_bundle: None,
+            proxy: None,
             normalize_ticks: true,
         }
     }
@@ -180,6 +183,7 @@ pub(crate) fn trunc(s: &str, n: usize) -> String { s.chars().take(n).collect() }
 impl Mt5Client {
     pub fn new(config: ClientConfig) -> Self {
         let transport = Transport::with_options(config.uri.clone(), config.timeout, config.rate_limit, config.rate_burst, config.metrics.clone(), config.ca_bundle.clone());
+        transport.set_proxy(config.proxy.clone());
         let state = Arc::new(Mutex::new(State { health_threshold_ms: 5000.0, normalize_ticks: config.normalize_ticks, next_action_id: 1, ..Default::default() }));
         let client = Self {
             inner: Arc::new(Inner {

@@ -85,6 +85,7 @@ struct Inner {
     shutdown: AtomicBool,
     metrics: Option<Arc<dyn MetricsCollector>>,
     ca_bundle: Option<std::path::PathBuf>,
+    proxy: Mutex<Option<String>>,
     last_message_at: Mutex<Option<Instant>>,
     server_build: AtomicU32,
 }
@@ -124,6 +125,7 @@ impl Transport {
                 shutdown: AtomicBool::new(false),
                 metrics,
                 ca_bundle,
+                proxy: Mutex::new(None),
                 last_message_at: Mutex::new(None),
                 server_build: AtomicU32::new(0),
             }),
@@ -162,6 +164,9 @@ impl Transport {
     }
 
     /// Open the socket, run the bootstrap handshake and switch to the session key.
+    /// Route the WebSocket through an HTTP `CONNECT` proxy (`http://[user:pass@]host:port`); `None` = direct.
+    pub fn set_proxy(&self, proxy: Option<String>) { *self.inner.proxy.lock().unwrap() = proxy; }
+
     pub async fn connect(&self) -> Result<()> {
         if self.inner.sink.lock().await.is_some() {
             self.close().await;
@@ -209,10 +214,26 @@ impl Transport {
         let mut req = uri.as_str().into_client_request()?;
         req.headers_mut().insert("Origin", "https://web.metatrader.app".parse().unwrap());
         let cfg = WebSocketConfig::default().max_message_size(None).max_frame_size(None);
-        let (ws, _) = tokio::time::timeout(self.inner.timeout, tokio_tungstenite::connect_async_tls_with_config(req, Some(cfg), false, Some(self.tls_connector()?)))
+        let proxy = self.inner.proxy.lock().unwrap().clone();
+        let connector = self.tls_connector().map_err(|e| e.to_string());
+        let connecting = async {
+            let connector = connector?;
+            match proxy {
+                None => tokio_tungstenite::connect_async_tls_with_config(req, Some(cfg), false, Some(connector)).await.map_err(|e| e.to_string()),
+                Some(p) => {
+                    let (host, port) = {
+                        let u = req.uri();
+                        (u.host().unwrap_or_default().to_string(), u.port_u16().unwrap_or(if u.scheme_str() == Some("ws") { 80 } else { 443 }))
+                    };
+                    let stream = http_connect(&p, &host, port).await.map_err(|e| format!("proxy: {e}"))?;
+                    tokio_tungstenite::client_async_tls_with_config(req, stream, Some(cfg), Some(connector)).await.map_err(|e| e.to_string())
+                }
+            }
+        };
+        let (ws, _) = tokio::time::timeout(self.inner.timeout, connecting)
             .await
             .map_err(|_| Error::Connection { message: format!("connect timed out after {:?}", self.inner.timeout), server_uri: uri.clone() })?
-            .map_err(|e| Error::Connection { message: e.to_string(), server_uri: uri.clone() })?;
+            .map_err(|message| Error::Connection { message, server_uri: uri.clone() })?;
         let (sink, stream) = ws.split();
         *self.inner.sink.lock().await = Some(sink);
         let this = self.clone();
@@ -383,5 +404,69 @@ impl Transport {
                 let _ = tx.send(Err(why.clone()));
             }
         }
+    }
+}
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() { out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char); } else { out.push('='); }
+        }
+    }
+    out
+}
+
+/// Open a TCP tunnel to `host:port` through an HTTP proxy (`CONNECT`). Returns the raw stream after the `200` reply.
+async fn http_connect(proxy: &str, host: &str, port: u16) -> std::result::Result<TcpStream, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = proxy.strip_prefix("http://").unwrap_or(proxy).trim_end_matches('/');
+    let (auth, addr) = match rest.rsplit_once('@') { Some((a, h)) => (Some(a), h), None => (None, rest) };
+    let mut s = TcpStream::connect(addr).await.map_err(|e| format!("connect {addr}: {e}"))?;
+    let mut req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+    if let Some(a) = auth { req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", base64(a.as_bytes()))); }
+    req.push_str("\r\n");
+    s.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    while !buf.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        if s.read(&mut b).await.map_err(|e| e.to_string())? == 0 { return Err("closed during CONNECT".into()); }
+        buf.push(b[0]);
+        if buf.len() > 16 * 1024 { return Err("CONNECT reply too large".into()); }
+    }
+    let status = String::from_utf8_lossy(&buf);
+    let line = status.lines().next().unwrap_or_default();
+    if line.split_whitespace().nth(1) != Some("200") { return Err(format!("CONNECT refused: {line}")); }
+    Ok(s)
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert_eq!(base64(b"a"), "YQ==");
+    }
+    #[tokio::test]
+    async fn connect_tunnel_through_fake_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 512];
+            let n = c.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            c.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            req
+        });
+        http_connect(&format!("http://u:p@{addr}"), "example.com", 443).await.unwrap();
+        let req = t.await.unwrap();
+        assert!(req.starts_with("CONNECT example.com:443 HTTP/1.1"));
+        assert!(req.contains("Proxy-Authorization: Basic dTpw"));
     }
 }
