@@ -54,8 +54,10 @@ pub fn encode_utf16le(value: &str, size: usize) -> Vec<u8> {
 /// Decode a UTF-16LE buffer, stopping at the first NUL code unit.
 pub fn decode_utf16le(data: &[u8]) -> String {
     let units: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .take_while(|u| *u != 0)
         .collect();
     char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect()
